@@ -1,3 +1,5 @@
+pub mod components;
+
 use std::any::TypeId;
 use std::collections::HashMap;
 use std::mem;
@@ -101,6 +103,11 @@ impl World {
 
         self.component_meta.insert(type_id, meta);
         self.next_component_id += 1;
+    }
+
+    pub fn get_component_id<T: Component>(&self) -> Option<ComponentId> {
+        let type_id = TypeId::of::<T>();
+        self.component_meta.get(&type_id).map(|meta| meta.id)
     }
 
     /// Finds an archetype that matches the given component set, or creates it if it doesn't exist.

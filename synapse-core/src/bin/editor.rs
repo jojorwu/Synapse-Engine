@@ -2,6 +2,9 @@
 use std::sync::Arc;
 use egui_wgpu::Renderer;
 use egui_winit::State;
+use synapse_core::ecs::World;
+use synapse_core::ecs::components::{ColorComponent, PositionComponent};
+use synapse_core::renderer::RendererContext;
 use winit::{
     event::{Event, WindowEvent},
     event_loop::{EventLoop},
@@ -17,12 +20,16 @@ enum ViewState {
 
 struct EditorUI {
     current_view: ViewState,
+    scene_texture_id: egui::TextureId,
+    last_scene_view_size: egui::Vec2,
 }
 
 impl EditorUI {
-    fn new() -> Self {
+    fn new(scene_texture_id: egui::TextureId) -> Self {
         Self {
             current_view: ViewState::ProjectManager,
+            scene_texture_id,
+            last_scene_view_size: egui::Vec2::ZERO,
         }
     }
 
@@ -54,7 +61,7 @@ impl EditorUI {
             });
     }
 
-    fn draw_main_editor(&self, ctx: &egui::Context) {
+    fn draw_main_editor(&mut self, ctx: &egui::Context) {
         egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
             ui.label("Toolbar Placeholder");
         });
@@ -68,22 +75,21 @@ impl EditorUI {
         });
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("Scene View");
-            ui.label("3D Scene Rendering Area");
+            let available_size = ui.available_size();
+            self.last_scene_view_size = available_size;
+            ui.image((self.scene_texture_id, available_size));
         });
     }
 }
 
 struct AppState {
-    surface: wgpu::Surface<'static>,
-    device: wgpu::Device,
-    queue: wgpu::Queue,
-    config: wgpu::SurfaceConfiguration,
-    size: winit::dpi::PhysicalSize<u32>,
+    renderer_context: RendererContext,
     window: Arc<Window>,
     egui_ctx: egui::Context,
     egui_state: State,
     egui_renderer: Renderer,
     editor_ui: EditorUI,
+    world: World,
 }
 
 impl AppState {
@@ -109,51 +115,74 @@ impl AppState {
 
         let egui_ctx = egui::Context::default();
         let egui_state = State::new(egui_ctx.clone(), egui::ViewportId::ROOT, &window, None, None);
-        let egui_renderer = Renderer::new(&device, config.format, None, 1);
-        let editor_ui = EditorUI::new();
+        let mut egui_renderer = Renderer::new(&device, config.format, None, 1);
+
+        let renderer_context = RendererContext::new(
+            window.clone(),
+            device,
+            queue,
+            surface,
+            config,
+            size,
+            &mut egui_renderer,
+        );
+
+        let editor_ui = EditorUI::new(renderer_context.scene_texture_id);
+
+        let mut world = World::new();
+        world.register_component::<PositionComponent>();
+        world.register_component::<ColorComponent>();
+
+        let entity = world.create_entity();
+        world.add_component(entity, PositionComponent { x: 0.0, y: 0.5, z: 0.0 });
+        world.add_component(entity, ColorComponent { r: 1.0, g: 0.0, b: 0.0 });
+        let entity = world.create_entity();
+        world.add_component(entity, PositionComponent { x: -0.5, y: -0.5, z: 0.0 });
+        world.add_component(entity, ColorComponent { r: 0.0, g: 1.0, b: 0.0 });
+        let entity = world.create_entity();
+        world.add_component(entity, PositionComponent { x: 0.5, y: -0.5, z: 0.0 });
+        world.add_component(entity, ColorComponent { r: 0.0, g: 0.0, b: 1.0 });
 
         Self {
             window,
-            surface,
-            device,
-            queue,
-            config,
-            size,
+            renderer_context,
             egui_ctx,
             egui_state,
             egui_renderer,
             editor_ui,
+            world,
         }
     }
 
     fn resize(&mut self, new_size: winit::dpi::PhysicalSize<u32>) {
-        if new_size.width > 0 && new_size.height > 0 {
-            self.size = new_size;
-            self.config.width = new_size.width;
-            self.config.height = new_size.height;
-            self.surface.configure(&self.device, &self.config);
-        }
+        self.renderer_context.resize(new_size);
     }
 
     fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
-        let output = self.surface.get_current_texture()?;
+        let output = self.renderer_context.surface.get_current_texture()?;
         let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let raw_input = self.egui_state.take_egui_input(&self.window);
 
+        self.renderer_context.render(&self.world);
+
+        let raw_input = self.egui_state.take_egui_input(&self.window);
         let full_output = self.egui_ctx.run(raw_input, |ctx| {
             self.editor_ui.draw(ctx);
         });
+
+        if self.editor_ui.last_scene_view_size.x > 0.0 && self.editor_ui.last_scene_view_size.y > 0.0 {
+            self.renderer_context.resize_scene_texture(self.editor_ui.last_scene_view_size, &mut self.egui_renderer);
+        }
 
         self.egui_state.handle_platform_output(&self.window, full_output.platform_output);
         let clipped_primitives = self.egui_ctx.tessellate(full_output.shapes, full_output.pixels_per_point);
 
         for (id, image_delta) in &full_output.textures_delta.set {
-            self.egui_renderer.update_texture(&self.device, &self.queue, *id, image_delta);
+            self.egui_renderer.update_texture(&self.renderer_context.device, &self.renderer_context.queue, *id, image_delta);
         }
 
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        let mut encoder = self.renderer_context.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
         let screen_descriptor = egui_wgpu::ScreenDescriptor {
-            size_in_pixels: [self.config.width, self.config.height],
+            size_in_pixels: [self.renderer_context.config.width, self.renderer_context.config.height],
             pixels_per_point: self.window.scale_factor() as f32,
         };
 
@@ -164,7 +193,7 @@ impl AppState {
                     view: &view,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        load: wgpu::LoadOp::Load,
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -179,7 +208,7 @@ impl AppState {
             self.egui_renderer.free_texture(id);
         }
 
-        self.queue.submit(std::iter::once(encoder.finish()));
+        self.renderer_context.queue.submit(std::iter::once(encoder.finish()));
         output.present();
         Ok(())
     }
@@ -221,8 +250,12 @@ pub fn main() {
             } => {
                 match state.render() {
                     Ok(_) => {}
-                    Err(wgpu::SurfaceError::Lost) => state.resize(state.size),
+                    Err(wgpu::SurfaceError::Lost) => {
+                        eprintln!("Surface lost, resizing...");
+                        state.resize(state.renderer_context.size)
+                    }
                     Err(wgpu::SurfaceError::OutOfMemory) => {
+                        eprintln!("Out of memory, exiting...");
                         control_flow.exit();
                     }
                     Err(e) => eprintln!("Render error: {:?}", e),
