@@ -1,20 +1,13 @@
 
-use crate::ecs::{ComponentId, World};
-use crate::ecs::components::{ColorComponent, PositionComponent};
+use crate::ecs::World;
+use crate::ecs::components::{ColorComponent, TransformComponent};
 use glam::{Mat4, Vec3};
-use std::collections::{HashMap, HashSet};
 use wgpu::util::DeviceExt;
 
 #[repr(C)]
 #[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 struct CameraUniform {
     view_proj: [[f32; 4]; 4],
-}
-
-pub struct CachedBuffers {
-    pos_buffer: wgpu::Buffer,
-    color_buffer: wgpu::Buffer,
-    len: u32,
 }
 
 struct DepthTexture {
@@ -29,10 +22,33 @@ pub struct Renderer {
     render_pipeline: wgpu::RenderPipeline,
     width: u32,
     height: u32,
-    buffer_cache: HashMap<Box<[ComponentId]>, CachedBuffers>,
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
     depth_texture: DepthTexture,
+    mesh: Mesh,
+    instance_buffer: wgpu::Buffer,
+    instances: Vec<InstanceRaw>,
+    texture: wgpu::Texture,
+    view: wgpu::TextureView,
+}
+
+struct Mesh {
+    vertex_buffer: wgpu::Buffer,
+    index_buffer: wgpu::Buffer,
+    num_indices: u32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct Vertex {
+    position: [f32; 3],
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct InstanceRaw {
+    model: [[f32; 4]; 4],
+    color: [f32; 4],
 }
 
 impl Renderer {
@@ -119,14 +135,14 @@ impl Renderer {
                 entry_point: "vs_main",
                 buffers: &[
                     wgpu::VertexBufferLayout {
-                        array_stride: std::mem::size_of::<PositionComponent>() as wgpu::BufferAddress,
+                        array_stride: std::mem::size_of::<Vertex>() as wgpu::BufferAddress,
                         step_mode: wgpu::VertexStepMode::Vertex,
                         attributes: &wgpu::vertex_attr_array![0 => Float32x3],
                     },
                     wgpu::VertexBufferLayout {
-                        array_stride: std::mem::size_of::<ColorComponent>() as wgpu::BufferAddress,
-                        step_mode: wgpu::VertexStepMode::Vertex,
-                        attributes: &wgpu::vertex_attr_array![1 => Float32x4],
+                        array_stride: std::mem::size_of::<InstanceRaw>() as wgpu::BufferAddress,
+                        step_mode: wgpu::VertexStepMode::Instance,
+                        attributes: &wgpu::vertex_attr_array![1 => Float32x4, 2 => Float32x4, 3 => Float32x4, 4 => Float32x4, 5 => Float32x4],
                     },
                 ],
             },
@@ -165,24 +181,55 @@ impl Renderer {
 
         let depth_texture = DepthTexture::new(&device, width, height);
 
-        Self {
-            device,
-            queue,
-            render_pipeline,
-            width,
-            height,
-            buffer_cache: HashMap::new(),
-            camera_buffer,
-            camera_bind_group,
-            depth_texture,
-        }
-    }
+        let vertices = &[
+            Vertex { position: [-0.5, -0.5, 0.5] },
+            Vertex { position: [0.5, -0.5, 0.5] },
+            Vertex { position: [0.5, 0.5, 0.5] },
+            Vertex { position: [-0.5, 0.5, 0.5] },
+            Vertex { position: [-0.5, -0.5, -0.5] },
+            Vertex { position: [0.5, -0.5, -0.5] },
+            Vertex { position: [0.5, 0.5, -0.5] },
+            Vertex { position: [-0.5, 0.5, -0.5] },
+        ];
+        let indices: &[u16] = &[
+            0, 1, 2, 2, 3, 0, // front
+            1, 5, 6, 6, 2, 1, // right
+            5, 4, 7, 7, 6, 5, // back
+            4, 0, 3, 3, 7, 4, // left
+            3, 2, 6, 6, 7, 3, // top
+            4, 5, 1, 1, 0, 4, // bottom
+        ];
 
-    pub fn render(&mut self, world: &World) {
+        let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Vertex Buffer"),
+            contents: bytemuck::cast_slice(vertices),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+        let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Index Buffer"),
+            contents: bytemuck::cast_slice(indices),
+            usage: wgpu::BufferUsages::INDEX,
+        });
+        let num_indices = indices.len() as u32;
+
+        let mesh = Mesh {
+            vertex_buffer,
+            index_buffer,
+            num_indices,
+        };
+
+        let instances = Vec::new();
+        let instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Instance Buffer"),
+            size: 0,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         let texture_desc = wgpu::TextureDescriptor {
             size: wgpu::Extent3d {
-                width: self.width,
-                height: self.height,
+                width,
+                height,
                 depth_or_array_layers: 1,
             },
             mip_level_count: 1,
@@ -193,8 +240,27 @@ impl Renderer {
             label: None,
             view_formats: &[],
         };
-        let texture = self.device.create_texture(&texture_desc);
+        let texture = device.create_texture(&texture_desc);
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        Self {
+            device,
+            queue,
+            render_pipeline,
+            width,
+            height,
+            camera_buffer,
+            camera_bind_group,
+            depth_texture,
+            mesh,
+            instance_buffer,
+            instances,
+            texture,
+            view,
+        }
+    }
+
+    pub fn render(&mut self, world: &World) {
 
         let mut encoder = self
             .device
@@ -221,62 +287,50 @@ impl Renderer {
             bytemuck::cast_slice(&[camera_uniform]),
         );
 
-        let pos_id = world.get_component_id::<PositionComponent>().unwrap();
+        let transform_id = world.get_component_id::<TransformComponent>().unwrap();
         let color_id = world.get_component_id::<ColorComponent>().unwrap();
 
-        let active_archetypes: HashSet<Box<[ComponentId]>> = world
-            .tables
-            .iter()
-            .filter(|a| {
-                a.component_ids.contains(&pos_id) && a.component_ids.contains(&color_id)
-            })
-            .map(|a| a.component_ids.clone().into_boxed_slice())
-            .collect();
-
-        self.buffer_cache
-            .retain(|k, _| active_archetypes.contains(k));
-
+        self.instances.clear();
         for archetype in &world.tables {
-            if archetype.component_ids.contains(&pos_id)
+            if archetype.component_ids.contains(&transform_id)
                 && archetype.component_ids.contains(&color_id)
             {
-                let pos_data = &archetype.columns[&pos_id];
-                let color_data = &archetype.columns[&color_id];
-                let key = archetype.component_ids.clone().into_boxed_slice();
+                let transforms = unsafe {
+                    std::slice::from_raw_parts(
+                        archetype.columns[&transform_id].as_ptr() as *const TransformComponent,
+                        archetype.len,
+                    )
+                };
+                let colors = unsafe {
+                    std::slice::from_raw_parts(
+                        archetype.columns[&color_id].as_ptr() as *const ColorComponent,
+                        archetype.len,
+                    )
+                };
 
-                let cached = self.buffer_cache.entry(key).or_insert_with(|| {
-                    let pos_buffer = create_buffer(&self.device, pos_data, "Position Vertex Buffer");
-                    let color_buffer =
-                        create_buffer(&self.device, color_data, "Color Vertex Buffer");
-                    CachedBuffers {
-                        pos_buffer,
-                        color_buffer,
-                        len: archetype.len as u32,
-                    }
-                });
-
-                if pos_data.len() as u64 > cached.pos_buffer.size() {
-                    cached.pos_buffer =
-                        create_buffer(&self.device, pos_data, "Position Vertex Buffer");
-                } else {
-                    self.queue.write_buffer(&cached.pos_buffer, 0, pos_data);
+                for (i, transform) in transforms.iter().enumerate() {
+                    self.instances.push(InstanceRaw {
+                        model: transform.to_matrix().to_cols_array_2d(),
+                        color: [colors[i].r, colors[i].g, colors[i].b, colors[i].a],
+                    });
                 }
-
-                if color_data.len() as u64 > cached.color_buffer.size() {
-                    cached.color_buffer =
-                        create_buffer(&self.device, color_data, "Color Vertex Buffer");
-                } else {
-                    self.queue.write_buffer(&cached.color_buffer, 0, color_data);
-                }
-                cached.len = archetype.len as u32;
             }
+        }
+
+        let instance_data = bytemuck::cast_slice(&self.instances);
+        if instance_data.len() as u64 > self.instance_buffer.size() {
+            self.instance_buffer =
+                create_buffer(&self.device, instance_data, "Instance Buffer");
+        } else {
+            self.queue
+                .write_buffer(&self.instance_buffer, 0, instance_data);
         }
 
         {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Render Pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
+                    view: &self.view,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
@@ -302,12 +356,10 @@ impl Renderer {
 
             render_pass.set_pipeline(&self.render_pipeline);
             render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
-
-            for cached in self.buffer_cache.values() {
-                render_pass.set_vertex_buffer(0, cached.pos_buffer.slice(..));
-                render_pass.set_vertex_buffer(1, cached.color_buffer.slice(..));
-                render_pass.draw(0..cached.len, 0..1);
-            }
+            render_pass.set_vertex_buffer(0, self.mesh.vertex_buffer.slice(..));
+            render_pass.set_vertex_buffer(1, self.instance_buffer.slice(..));
+            render_pass.set_index_buffer(self.mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+            render_pass.draw_indexed(0..self.mesh.num_indices, 0, 0..self.instances.len() as u32);
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
