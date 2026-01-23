@@ -7,3 +7,6 @@ Cargo.lock
 
 # Ignore editor configuration files
 .vscode/
+
+# Ignore log files
+editor.log
