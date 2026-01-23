@@ -9,3 +9,8 @@ wgpu = "0.19.1"
 pollster = "0.3.0"
 bytemuck = { version = "1.24.0", features = ["derive"] }
 glam = "0.24"
+egui = "0.27.2"
+egui-wgpu = "0.27.2"
+egui-winit = "0.27.2"
+winit = "0.29.15"
+thiserror = "1.0"
