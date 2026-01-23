@@ -1,6 +1,6 @@
 
 use glam::Quat;
-use synapse_core::ecs::components::{ColorComponent, TransformComponent};
+use synapse_core::ecs::components::{ColorComponent, RectangleComponent, TransformComponent};
 use synapse_core::ecs::World;
 use synapse_core::renderer::Renderer;
 use std::env;
@@ -12,6 +12,7 @@ fn renderer_initializes_and_renders_without_panic_offscreen() {
 
     world.register_component::<TransformComponent>();
     world.register_component::<ColorComponent>();
+    world.register_component::<RectangleComponent>();
 
     let entity1 = world.create_entity();
     world.add_component(
@@ -45,6 +46,18 @@ fn renderer_initializes_and_renders_without_panic_offscreen() {
         },
     );
     world.add_component(entity3, ColorComponent { r: 0.0, g: 0.0, b: 1.0, a: 1.0 });
+
+    let entity4 = world.create_entity();
+    world.add_component(
+        entity4,
+        RectangleComponent {
+            x: 10.0,
+            y: 10.0,
+            width: 100.0,
+            height: 100.0,
+        },
+    );
+    world.add_component(entity4, ColorComponent { r: 1.0, g: 1.0, b: 0.0, a: 0.5 });
 
     let mut renderer = pollster::block_on(Renderer::new(1024, 768));
 

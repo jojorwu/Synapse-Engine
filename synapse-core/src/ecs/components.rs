@@ -32,3 +32,14 @@ pub struct ColorComponent {
 }
 
 impl Component for ColorComponent {}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable, Debug, PartialEq)]
+pub struct RectangleComponent {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+}
+
+impl Component for RectangleComponent {}
