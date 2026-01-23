@@ -1,0 +1,628 @@
+
+use crate::ecs::World;
+use crate::ecs::components::{ColorComponent, RectangleComponent, TransformComponent};
+use glam::{Mat4, Vec3};
+use wgpu::util::DeviceExt;
+
+#[repr(C)]
+#[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct CameraUniform {
+    view_proj: [[f32; 4]; 4],
+}
+
+struct DepthTexture {
+    texture: wgpu::Texture,
+    view: wgpu::TextureView,
+    sampler: wgpu::Sampler,
+}
+
+pub struct Renderer {
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    render_pipeline: wgpu::RenderPipeline,
+    width: u32,
+    height: u32,
+    camera_buffer: wgpu::Buffer,
+    camera_bind_group: wgpu::BindGroup,
+    depth_texture: DepthTexture,
+    mesh: Mesh,
+    instance_buffer: wgpu::Buffer,
+    instances: Vec<InstanceRaw>,
+    texture: wgpu::Texture,
+    view: wgpu::TextureView,
+    render_pipeline_2d: wgpu::RenderPipeline,
+    camera_buffer_2d: wgpu::Buffer,
+    camera_bind_group_2d: wgpu::BindGroup,
+    vertex_buffer_2d: wgpu::Buffer,
+    color_buffer_2d: wgpu::Buffer,
+    num_vertices_2d: u32,
+}
+
+struct Mesh {
+    vertex_buffer: wgpu::Buffer,
+    index_buffer: wgpu::Buffer,
+    num_indices: u32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct Vertex {
+    position: [f32; 3],
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct InstanceRaw {
+    model: [[f32; 4]; 4],
+    color: [f32; 4],
+}
+
+impl Renderer {
+    pub async fn new(width: u32, height: u32) -> Self {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::all(),
+            ..Default::default()
+        });
+
+        let adapter = instance
+            .request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::default(),
+                compatible_surface: None,
+                force_fallback_adapter: false,
+            })
+            .await
+            .unwrap();
+
+        let (device, queue) = adapter
+            .request_device(
+                &wgpu::DeviceDescriptor {
+                    required_features: wgpu::Features::empty(),
+                    required_limits: wgpu::Limits::default(),
+                    label: None,
+                },
+                None, // Trace path
+            )
+            .await
+            .unwrap();
+
+        let texture_format = wgpu::TextureFormat::Rgba8UnormSrgb;
+
+        let camera_uniform = CameraUniform {
+            view_proj: Mat4::IDENTITY.to_cols_array_2d(),
+        };
+
+        let camera_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Camera Buffer"),
+            contents: bytemuck::cast_slice(&[camera_uniform]),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
+        let camera_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                }],
+                label: Some("camera_bind_group_layout"),
+            });
+
+        let camera_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            layout: &camera_bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: camera_buffer.as_entire_binding(),
+            }],
+            label: Some("camera_bind_group"),
+        });
+
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
+        });
+
+        let render_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Render Pipeline Layout"),
+                bind_group_layouts: &[&camera_bind_group_layout],
+                push_constant_ranges: &[],
+            });
+
+        let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Render Pipeline"),
+            layout: Some(&render_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: "vs_main",
+                buffers: &[
+                    wgpu::VertexBufferLayout {
+                        array_stride: std::mem::size_of::<Vertex>() as wgpu::BufferAddress,
+                        step_mode: wgpu::VertexStepMode::Vertex,
+                        attributes: &wgpu::vertex_attr_array![0 => Float32x3],
+                    },
+                    wgpu::VertexBufferLayout {
+                        array_stride: std::mem::size_of::<InstanceRaw>() as wgpu::BufferAddress,
+                        step_mode: wgpu::VertexStepMode::Instance,
+                        attributes: &wgpu::vertex_attr_array![1 => Float32x4, 2 => Float32x4, 3 => Float32x4, 4 => Float32x4, 5 => Float32x4],
+                    },
+                ],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: "fs_main",
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: texture_format,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: Some(wgpu::Face::Back),
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: true,
+                depth_compare: wgpu::CompareFunction::Less,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState {
+                count: 1,
+                mask: !0,
+                alpha_to_coverage_enabled: false,
+            },
+            multiview: None,
+        });
+
+        let depth_texture = DepthTexture::new(&device, width, height);
+
+        let vertices = &[
+            Vertex { position: [-0.5, -0.5, 0.5] },
+            Vertex { position: [0.5, -0.5, 0.5] },
+            Vertex { position: [0.5, 0.5, 0.5] },
+            Vertex { position: [-0.5, 0.5, 0.5] },
+            Vertex { position: [-0.5, -0.5, -0.5] },
+            Vertex { position: [0.5, -0.5, -0.5] },
+            Vertex { position: [0.5, 0.5, -0.5] },
+            Vertex { position: [-0.5, 0.5, -0.5] },
+        ];
+        let indices: &[u16] = &[
+            0, 1, 2, 2, 3, 0, // front
+            1, 5, 6, 6, 2, 1, // right
+            5, 4, 7, 7, 6, 5, // back
+            4, 0, 3, 3, 7, 4, // left
+            3, 2, 6, 6, 7, 3, // top
+            4, 5, 1, 1, 0, 4, // bottom
+        ];
+
+        let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Vertex Buffer"),
+            contents: bytemuck::cast_slice(vertices),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+        let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Index Buffer"),
+            contents: bytemuck::cast_slice(indices),
+            usage: wgpu::BufferUsages::INDEX,
+        });
+        let num_indices = indices.len() as u32;
+
+        let mesh = Mesh {
+            vertex_buffer,
+            index_buffer,
+            num_indices,
+        };
+
+        let shader_2d = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Shader 2D"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shader_2d.wgsl").into()),
+        });
+
+        let camera_uniform_2d = CameraUniform {
+            view_proj: Mat4::orthographic_rh_gl(0.0, width as f32, height as f32, 0.0, -1.0, 1.0)
+                .to_cols_array_2d(),
+        };
+
+        let camera_buffer_2d = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Camera Buffer 2D"),
+            contents: bytemuck::cast_slice(&[camera_uniform_2d]),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
+        let camera_bind_group_layout_2d =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                }],
+                label: Some("camera_bind_group_layout_2d"),
+            });
+
+        let camera_bind_group_2d = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            layout: &camera_bind_group_layout_2d,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: camera_buffer_2d.as_entire_binding(),
+            }],
+            label: Some("camera_bind_group_2d"),
+        });
+
+        let render_pipeline_layout_2d =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Render Pipeline Layout 2D"),
+                bind_group_layouts: &[&camera_bind_group_layout_2d],
+                push_constant_ranges: &[],
+            });
+
+        let render_pipeline_2d =
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("Render Pipeline 2D"),
+                layout: Some(&render_pipeline_layout_2d),
+                vertex: wgpu::VertexState {
+                    module: &shader_2d,
+                    entry_point: "vs_main",
+                    buffers: &[wgpu::VertexBufferLayout {
+                        array_stride: std::mem::size_of::<[f32; 2]>() as wgpu::BufferAddress,
+                        step_mode: wgpu::VertexStepMode::Vertex,
+                        attributes: &wgpu::vertex_attr_array![0 => Float32x2],
+                    },
+                    wgpu::VertexBufferLayout {
+                        array_stride: std::mem::size_of::<[f32; 4]>() as wgpu::BufferAddress,
+                        step_mode: wgpu::VertexStepMode::Vertex,
+                        attributes: &wgpu::vertex_attr_array![1 => Float32x4],
+                    },
+                ],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader_2d,
+                    entry_point: "fs_main",
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: texture_format,
+                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    ..Default::default()
+                },
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview: None,
+            });
+
+        let instances = Vec::new();
+        let instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Instance Buffer"),
+            size: 0,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let texture_desc = wgpu::TextureDescriptor {
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            label: None,
+            view_formats: &[],
+        };
+        let texture = device.create_texture(&texture_desc);
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let vertex_buffer_2d = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Vertex Buffer 2D"),
+            size: 0,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let color_buffer_2d = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Color Buffer 2D"),
+            size: 0,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        Self {
+            device,
+            queue,
+            render_pipeline,
+            width,
+            height,
+            camera_buffer,
+            camera_bind_group,
+            depth_texture,
+            mesh,
+            instance_buffer,
+            instances,
+            texture,
+            view,
+            render_pipeline_2d,
+            camera_buffer_2d,
+            camera_bind_group_2d,
+            vertex_buffer_2d,
+            color_buffer_2d,
+            num_vertices_2d: 0,
+        }
+    }
+
+    pub fn render(&mut self, world: &World) {
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Render Encoder"),
+            });
+
+        let camera_uniform = CameraUniform {
+            view_proj: (Mat4::perspective_rh_gl(
+                45.0f32.to_radians(),
+                self.width as f32 / self.height as f32,
+                0.1,
+                100.0,
+            ) * Mat4::look_at_rh(
+                Vec3::new(0.0, 1.0, 3.0),
+                Vec3::ZERO,
+                Vec3::Y,
+            ))
+            .to_cols_array_2d(),
+        };
+        self.queue.write_buffer(
+            &self.camera_buffer,
+            0,
+            bytemuck::cast_slice(&[camera_uniform]),
+        );
+
+        let transform_id = world.get_component_id::<TransformComponent>().unwrap();
+        let color_id = world.get_component_id::<ColorComponent>().unwrap();
+
+        self.instances.clear();
+        for archetype in &world.tables {
+            if archetype.component_ids.contains(&transform_id)
+                && archetype.component_ids.contains(&color_id)
+            {
+                // UNSAFE: This is a direct memory access to the component data.
+                // It is safe under the following conditions, enforced by the ECS:
+                // 1. The archetype contains the `TransformComponent` and `ColorComponent`.
+                // 2. The `archetype.len` accurately reflects the number of entities.
+                // 3. The underlying `Vec<u8>` in the column is tightly packed and
+                //    correctly aligned for the component type.
+                let transforms = unsafe {
+                    std::slice::from_raw_parts(
+                        archetype.columns[&transform_id].as_ptr() as *const TransformComponent,
+                        archetype.len,
+                    )
+                };
+                let colors = unsafe {
+                    std::slice::from_raw_parts(
+                        archetype.columns[&color_id].as_ptr() as *const ColorComponent,
+                        archetype.len,
+                    )
+                };
+
+                for (i, transform) in transforms.iter().enumerate() {
+                    self.instances.push(InstanceRaw {
+                        model: transform.to_matrix().to_cols_array_2d(),
+                        color: [colors[i].r, colors[i].g, colors[i].b, colors[i].a],
+                    });
+                }
+            }
+        }
+
+        let instance_data = bytemuck::cast_slice(&self.instances);
+        if instance_data.len() as u64 > self.instance_buffer.size() {
+            self.instance_buffer =
+                self.device
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("Instance Buffer"),
+                        contents: instance_data,
+                        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                    });
+        } else {
+            self.queue
+                .write_buffer(&self.instance_buffer, 0, instance_data);
+        }
+
+        {
+            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Render Pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: 0.1,
+                            g: 0.2,
+                            b: 0.3,
+                            a: 1.0,
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.depth_texture.view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                occlusion_query_set: None,
+                timestamp_writes: None,
+            });
+
+            render_pass.set_pipeline(&self.render_pipeline);
+            render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
+            render_pass.set_vertex_buffer(0, self.mesh.vertex_buffer.slice(..));
+            render_pass.set_vertex_buffer(1, self.instance_buffer.slice(..));
+            render_pass.set_index_buffer(self.mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+            render_pass.draw_indexed(0..self.mesh.num_indices, 0, 0..self.instances.len() as u32);
+        }
+
+        let rect_id = world.get_component_id::<RectangleComponent>().unwrap();
+        let color_id = world.get_component_id::<ColorComponent>().unwrap();
+
+        let mut vertices_2d = Vec::new();
+        let mut colors_2d = Vec::new();
+        for archetype in &world.tables {
+            if archetype.component_ids.contains(&rect_id)
+                && archetype.component_ids.contains(&color_id)
+            {
+                // UNSAFE: This is a direct memory access to the component data.
+                // It is safe under the following conditions, enforced by the ECS:
+                // 1. The archetype contains the `RectangleComponent` and `ColorComponent`.
+                // 2. The `archetype.len` accurately reflects the number of entities.
+                // 3. The underlying `Vec<u8>` in the column is tightly packed and
+                //    correctly aligned for the component type.
+                let rects = unsafe {
+                    std::slice::from_raw_parts(
+                        archetype.columns[&rect_id].as_ptr() as *const RectangleComponent,
+                        archetype.len,
+                    )
+                };
+                let colors = unsafe {
+                    std::slice::from_raw_parts(
+                        archetype.columns[&color_id].as_ptr() as *const ColorComponent,
+                        archetype.len,
+                    )
+                };
+
+                for (i, rect) in rects.iter().enumerate() {
+                    let x = rect.x;
+                    let y = rect.y;
+                    let w = rect.width;
+                    let h = rect.height;
+                    let color = [colors[i].r, colors[i].g, colors[i].b, colors[i].a];
+                    vertices_2d.extend_from_slice(&[
+                        [x, y],
+                        [x + w, y],
+                        [x, y + h],
+                        [x, y + h],
+                        [x + w, y],
+                        [x + w, y + h],
+                    ]);
+                    colors_2d.extend_from_slice(&[color, color, color, color, color, color]);
+                }
+            }
+        }
+
+        self.num_vertices_2d = vertices_2d.len() as u32;
+        let vertex_data = bytemuck::cast_slice(&vertices_2d);
+        if vertex_data.len() as u64 > self.vertex_buffer_2d.size() {
+            self.vertex_buffer_2d =
+                self.device
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("Vertex Buffer 2D"),
+                        contents: vertex_data,
+                        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                    });
+        } else {
+            self.queue
+                .write_buffer(&self.vertex_buffer_2d, 0, vertex_data);
+        }
+
+        let color_data = bytemuck::cast_slice(&colors_2d);
+        if color_data.len() as u64 > self.color_buffer_2d.size() {
+            self.color_buffer_2d =
+                self.device
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("Color Buffer 2D"),
+                        contents: color_data,
+                        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                    });
+        } else {
+            self.queue
+                .write_buffer(&self.color_buffer_2d, 0, color_data);
+        }
+
+        {
+            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Render Pass 2D"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                occlusion_query_set: None,
+                timestamp_writes: None,
+            });
+
+            render_pass.set_pipeline(&self.render_pipeline_2d);
+            render_pass.set_bind_group(0, &self.camera_bind_group_2d, &[]);
+            render_pass.set_vertex_buffer(0, self.vertex_buffer_2d.slice(..));
+            render_pass.set_vertex_buffer(1, self.color_buffer_2d.slice(..));
+            render_pass.draw(0..self.num_vertices_2d, 0..1);
+        }
+
+        self.queue.submit(std::iter::once(encoder.finish()));
+    }
+}
+
+impl DepthTexture {
+    fn new(device: &wgpu::Device, width: u32, height: u32) -> Self {
+        let size = wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        };
+        let desc = wgpu::TextureDescriptor {
+            label: Some("Depth Texture"),
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Depth32Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        };
+        let texture = device.create_texture(&desc);
+
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::FilterMode::Nearest,
+            compare: Some(wgpu::CompareFunction::LessEqual),
+            lod_min_clamp: 0.0,
+            lod_max_clamp: 100.0,
+            ..Default::default()
+        });
+
+        Self {
+            texture,
+            view,
+            sampler,
+        }
+    }
+}
