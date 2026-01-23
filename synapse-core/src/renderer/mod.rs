@@ -1,8 +1,15 @@
 
 use crate::ecs::{ComponentId, World};
 use crate::ecs::components::{ColorComponent, PositionComponent};
+use glam::{Mat4, Vec3};
 use std::collections::{HashMap, HashSet};
 use wgpu::util::DeviceExt;
+
+#[repr(C)]
+#[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct CameraUniform {
+    view_proj: [[f32; 4]; 4],
+}
 
 pub struct CachedBuffers {
     pos_buffer: wgpu::Buffer,
@@ -17,6 +24,8 @@ pub struct Renderer {
     width: u32,
     height: u32,
     buffer_cache: HashMap<Box<[ComponentId]>, CachedBuffers>,
+    camera_buffer: wgpu::Buffer,
+    camera_bind_group: wgpu::BindGroup,
 }
 
 impl Renderer {
@@ -49,6 +58,40 @@ impl Renderer {
 
         let texture_format = wgpu::TextureFormat::Rgba8UnormSrgb;
 
+        let camera_uniform = CameraUniform {
+            view_proj: Mat4::IDENTITY.to_cols_array_2d(),
+        };
+
+        let camera_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Camera Buffer"),
+            contents: bytemuck::cast_slice(&[camera_uniform]),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
+        let camera_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                }],
+                label: Some("camera_bind_group_layout"),
+            });
+
+        let camera_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            layout: &camera_bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: camera_buffer.as_entire_binding(),
+            }],
+            label: Some("camera_bind_group"),
+        });
+
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
@@ -57,7 +100,7 @@ impl Renderer {
         let render_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("Render Pipeline Layout"),
-                bind_group_layouts: &[],
+                bind_group_layouts: &[&camera_bind_group_layout],
                 push_constant_ranges: &[],
             });
 
@@ -114,6 +157,8 @@ impl Renderer {
             width,
             height,
             buffer_cache: HashMap::new(),
+            camera_buffer,
+            camera_bind_group,
         }
     }
 
@@ -140,6 +185,25 @@ impl Renderer {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("Render Encoder"),
             });
+
+        let camera_uniform = CameraUniform {
+            view_proj: (Mat4::perspective_rh_gl(
+                45.0f32.to_radians(),
+                self.width as f32 / self.height as f32,
+                0.1,
+                100.0,
+            ) * Mat4::look_at_rh(
+                Vec3::new(0.0, 1.0, 3.0),
+                Vec3::ZERO,
+                Vec3::Y,
+            ))
+            .to_cols_array_2d(),
+        };
+        self.queue.write_buffer(
+            &self.camera_buffer,
+            0,
+            bytemuck::cast_slice(&[camera_uniform]),
+        );
 
         let pos_id = world.get_component_id::<PositionComponent>().unwrap();
         let color_id = world.get_component_id::<ColorComponent>().unwrap();
@@ -214,6 +278,7 @@ impl Renderer {
             });
 
             render_pass.set_pipeline(&self.render_pipeline);
+            render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
 
             for cached in self.buffer_cache.values() {
                 render_pass.set_vertex_buffer(0, cached.pos_buffer.slice(..));
