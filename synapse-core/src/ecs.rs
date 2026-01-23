@@ -26,7 +26,8 @@ pub struct ArchetypeTable {
     // The set of component IDs that define this archetype.
     pub component_ids: Vec<ComponentId>,
     // Columns storing the actual component data as raw bytes.
-    pub columns: HashMap<ComponentId, Box<[u8]>>,
+    // Using Vec<u8> instead of Box<[u8]> allows for dynamic resizing.
+    pub columns: HashMap<ComponentId, Vec<u8>>,
     // Bitmask for tracking changed ("dirty") data for network sync.
     pub dirty_masks: HashMap<ComponentId, BitVec>,
     pub capacity: usize,
@@ -143,67 +144,104 @@ impl World {
         new_archetype_id
     }
 
-    // A simplified placeholder for moving component data.
-    // A real implementation would be more optimized and handle memory allocation better.
-    fn move_entity_data(
-        &mut self,
-        entity_id: EntityId,
-        src_archetype_id: ArchetypeId,
-        src_row: usize,
-        dest_archetype_id: ArchetypeId,
-    ) {
-        // This logic is complex and will be implemented properly later.
-        // For now, we simulate the move by just updating the map.
-
-        let (source_archetype, dest_archetype) = if src_archetype_id < dest_archetype_id {
-            let (left, right) = self.tables.split_at_mut(dest_archetype_id);
-            (&mut left[src_archetype_id], &mut right[0])
-        } else {
-            let (left, right) = self.tables.split_at_mut(src_archetype_id);
-            (&mut right[0], &mut left[dest_archetype_id])
-        };
-
-        // Simplified logic: remove from source, add to destination
-        source_archetype.entity_ids.swap_remove(src_row);
-
-        if src_row < source_archetype.entity_ids.len() {
-            let moved_entity_id = source_archetype.entity_ids[src_row];
-            self.entity_map.get_mut(&moved_entity_id).unwrap().row = src_row;
-        }
-
-        let dest_row = dest_archetype.entity_ids.len();
-        dest_archetype.entity_ids.push(entity_id);
-
-        self.entity_map.insert(entity_id, EntityLocation {
-            archetype_id: dest_archetype_id,
-            row: dest_row,
-        });
-    }
-
-    /// Adds a component of type `T` to the given entity.
-    /// Note: This is a simplified version. A full implementation requires careful memory management.
-    pub fn add_component<T: Component>(&mut self, entity_id: EntityId, _component: T) {
+    /// Adds a component of type `T` to the given entity, moving it to a new archetype.
+    pub fn add_component<T: Component>(&mut self, entity_id: EntityId, component: T) {
         let component_type_id = TypeId::of::<T>();
         let component_id = self.component_meta.get(&component_type_id)
             .expect("Component type not registered!").id;
 
-        let current_location = self.entity_map.get(&entity_id).expect("Entity not found!").clone();
+        let src_location = *self.entity_map.get(&entity_id).expect("Entity not found!");
 
-        // --- Borrow checker fix ---
-        // First, perform the mutable operation to get the destination archetype ID.
-        let dest_archetype_id = self.find_or_create_archetype(current_location.archetype_id, component_id);
+        let dest_archetype_id = self.find_or_create_archetype(src_location.archetype_id, component_id);
 
-        // Now, we can proceed with the rest of the logic without holding a mutable borrow.
-        let current_archetype_id = self.entity_map.get(&entity_id).unwrap().archetype_id;
-
-        if dest_archetype_id == current_archetype_id {
-            // The entity already has this component (or one with the same archetype transition).
+        if dest_archetype_id == src_location.archetype_id {
+            // The entity already has this component. We could update the value, but for now we do nothing.
             return;
         }
 
-        // The actual data move is complex. We'll simulate it for now.
-        let src_row = self.entity_map.get(&entity_id).unwrap().row;
-        self.move_entity_data(entity_id, current_archetype_id, src_row, dest_archetype_id);
+        // --- Data Move Operation ---
+        let (src_archetype, dest_archetype) = if src_location.archetype_id < dest_archetype_id {
+            let (left, right) = self.tables.split_at_mut(dest_archetype_id);
+            (&mut left[src_location.archetype_id], &mut right[0])
+        } else {
+            let (left, right) = self.tables.split_at_mut(src_location.archetype_id);
+            (&mut right[0], &mut left[dest_archetype_id])
+        };
+
+        let dest_row = dest_archetype.len;
+
+        // 1. Copy old component data from source to destination.
+        for &comp_id in &src_archetype.component_ids.clone() {
+            let src_col = src_archetype.columns.get(&comp_id).unwrap();
+            let dest_col = dest_archetype.columns.entry(comp_id).or_insert_with(Vec::new);
+            let size = self.component_meta.values().find(|meta| meta.id == comp_id).unwrap().size;
+
+            let start = src_location.row * size;
+            let end = start + size;
+            dest_col.extend_from_slice(&src_col[start..end]);
+        }
+
+        // 2. Add the new component's data to the destination.
+        let new_comp_size = mem::size_of::<T>();
+        let dest_col = dest_archetype.columns.entry(component_id).or_insert_with(Vec::new);
+        unsafe {
+            let bytes = std::slice::from_raw_parts(&component as *const T as *const u8, new_comp_size);
+            dest_col.extend_from_slice(bytes);
+        }
+
+        // 3. Remove entity from the source archetype using swap_remove.
+        let last_row_in_src = src_archetype.len - 1;
+        for &comp_id in &src_archetype.component_ids {
+            let col = src_archetype.columns.get_mut(&comp_id).unwrap();
+            let size = self.component_meta.values().find(|meta| meta.id == comp_id).unwrap().size;
+
+            let src_start = src_location.row * size;
+
+            if src_location.row < last_row_in_src {
+                let last_start = last_row_in_src * size;
+                let last_end = last_start + size;
+                col.copy_within(last_start..last_end, src_start);
+            }
+            col.truncate(last_row_in_src * size);
+        }
+
+        let moved_entity_id = src_archetype.entity_ids.swap_remove(src_location.row);
+        src_archetype.len -= 1;
+
+        if src_location.row < src_archetype.len {
+            // If an entity was moved to fill the gap, update its location in the map.
+            self.entity_map.get_mut(&moved_entity_id).unwrap().row = src_location.row;
+        }
+
+        // 4. Finalize the move.
+        dest_archetype.entity_ids.push(entity_id);
+        dest_archetype.len += 1;
+
+        let new_location = self.entity_map.get_mut(&entity_id).unwrap();
+        new_location.archetype_id = dest_archetype_id;
+        new_location.row = dest_row;
+    }
+
+    /// Gets a reference to a component of type `T` for the given entity.
+    pub fn get_component<T: Component>(&self, entity_id: EntityId) -> Option<&T> {
+        let location = self.entity_map.get(&entity_id)?;
+        let archetype = &self.tables[location.archetype_id];
+
+        let component_type_id = TypeId::of::<T>();
+        let component_id = self.component_meta.get(&component_type_id)?.id;
+
+        let column = archetype.columns.get(&component_id)?;
+
+        let size = mem::size_of::<T>();
+        let start = location.row * size;
+        let end = start + size;
+        let bytes = &column[start..end];
+
+        // This is unsafe because we are reinterpreting raw bytes as a specific type.
+        // It's safe here because we've verified the component type and size.
+        unsafe {
+            Some(&*(bytes.as_ptr() as *const T))
+        }
     }
 
     /// Creates a new entity with no components.
@@ -257,14 +295,16 @@ mod tests {
     }
 
     // Define some test components
-    struct Position { _x: f32, _y: f32 }
+    #[derive(PartialEq, Debug, Clone, Copy)]
+    struct Position { x: f32, y: f32 }
     impl Component for Position {}
 
-    struct Velocity { _dx: f32, _dy: f32 }
+    #[derive(PartialEq, Debug, Clone, Copy)]
+    struct Velocity { dx: f32, dy: f32 }
     impl Component for Velocity {}
 
     #[test]
-    fn add_component_moves_entity_to_new_archetype() {
+    fn add_component_moves_entity_and_data_correctly() {
         let mut world = World::new();
 
         world.register_component::<Position>();
@@ -278,7 +318,7 @@ mod tests {
         assert_eq!(world.tables[0].entity_ids.len(), 1);
 
         // 2. Add Position component
-        world.add_component(entity, Position { _x: 0.0, _y: 0.0 });
+        world.add_component(entity, Position { x: 1.0, y: 2.0 });
 
         let loc1_archetype_id = world.entity_map.get(&entity).unwrap().archetype_id;
         assert_ne!(loc1_archetype_id, 0); // Should have moved
@@ -289,8 +329,12 @@ mod tests {
         assert_eq!(archetype1.entity_ids.len(), 1);
         assert_eq!(archetype1.entity_ids[0], entity);
 
+        // Verify data integrity
+        let pos = world.get_component::<Position>(entity).unwrap();
+        assert_eq!(*pos, Position { x: 1.0, y: 2.0 });
+
         // 3. Add Velocity component
-        world.add_component(entity, Velocity { _dx: 1.0, _dy: 0.0 });
+        world.add_component(entity, Velocity { dx: 1.0, dy: 0.0 });
 
         let loc2_archetype_id = world.entity_map.get(&entity).unwrap().archetype_id;
         assert_ne!(loc2_archetype_id, loc1_archetype_id); // Should have moved again
@@ -300,5 +344,11 @@ mod tests {
         let archetype2 = &world.tables[loc2_archetype_id];
         assert_eq!(archetype2.entity_ids.len(), 1);
         assert_eq!(archetype2.entity_ids[0], entity);
+
+        // Verify data integrity again
+        let pos_after_move = world.get_component::<Position>(entity).unwrap();
+        let vel_after_move = world.get_component::<Velocity>(entity).unwrap();
+        assert_eq!(*pos_after_move, Position { x: 1.0, y: 2.0 });
+        assert_eq!(*vel_after_move, Velocity { dx: 1.0, dy: 0.0 });
     }
 }
