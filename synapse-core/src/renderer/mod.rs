@@ -19,6 +19,11 @@ pub enum RendererError {
     GetDevice(#[from] wgpu::RequestDeviceError),
 }
 
+pub struct RendererSettings {
+    pub light_position: [f32; 3],
+    pub light_color: [f32; 3],
+}
+
 #[repr(C)]
 #[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 struct CameraUniform {
@@ -64,6 +69,7 @@ pub struct Renderer<'a> {
     egui_context: egui::Context,
     egui_winit_state: egui_winit::State,
     egui_renderer: egui_wgpu::Renderer,
+    pub settings: RendererSettings,
 }
 
 struct Mesh {
@@ -440,6 +446,11 @@ impl<'a> Renderer<'a> {
         let egui_winit_state = egui_winit::State::new(egui_context.clone(), egui::ViewportId::ROOT, &window, None, None);
         let egui_renderer = egui_wgpu::Renderer::new(&device, config.format, None, 1);
 
+        let settings = RendererSettings {
+            light_position: light_uniform.position,
+            light_color: light_uniform.color,
+        };
+
         Ok(Self {
             instance,
             surface,
@@ -464,6 +475,7 @@ impl<'a> Renderer<'a> {
             egui_context,
             egui_winit_state,
             egui_renderer,
+            settings,
         })
     }
 
@@ -507,6 +519,18 @@ impl<'a> Renderer<'a> {
             &self.camera_buffer,
             0,
             bytemuck::cast_slice(&[camera_uniform]),
+        );
+
+        let light_uniform = LightUniform {
+            position: self.settings.light_position,
+            _padding: 0,
+            color: self.settings.light_color,
+            _padding2: 0,
+        };
+        self.queue.write_buffer(
+            &self.light_buffer,
+            0,
+            bytemuck::cast_slice(&[light_uniform]),
         );
 
         let transform_id = world.get_component_id::<TransformComponent>().unwrap();
@@ -699,6 +723,16 @@ impl<'a> Renderer<'a> {
         let full_output = self.egui_context.run(raw_input, |ctx| {
             egui::Window::new("Dev Panel").show(ctx, |ui| {
                 ui.label(format!("Entity count: {}", world.entity_map.len()));
+            });
+
+            egui::Window::new("Render Settings").show(ctx, |ui| {
+                ui.label("Light Position");
+                ui.add(egui::Slider::new(&mut self.settings.light_position[0], -10.0..=10.0).text("X"));
+                ui.add(egui::Slider::new(&mut self.settings.light_position[1], -10.0..=10.0).text("Y"));
+                ui.add(egui::Slider::new(&mut self.settings.light_position[2], -10.0..=10.0).text("Z"));
+
+                ui.label("Light Color");
+                ui.color_edit_button_rgb(&mut self.settings.light_color);
             });
         });
 
