@@ -4,10 +4,21 @@ use synapse_core::ecs::components::{ColorComponent, RectangleComponent, Transfor
 use synapse_core::ecs::World;
 use synapse_core::renderer::Renderer;
 use std::env;
+use winit::{
+    event_loop::EventLoopBuilder,
+    window::WindowBuilder,
+};
+#[cfg(target_os = "linux")]
+use winit::platform::x11::EventLoopBuilderExtX11;
 
 #[test]
-fn renderer_initializes_and_renders_without_panic_offscreen() {
+fn renderer_initializes_and_renders_to_window_without_panic() {
     env::set_var("XDG_RUNTIME_DIR", "/tmp");
+    let mut builder = EventLoopBuilder::new();
+    #[cfg(target_os = "linux")]
+    builder.with_any_thread(true);
+    let event_loop = builder.build().unwrap();
+    let window = WindowBuilder::new().with_visible(false).build(&event_loop).unwrap();
     let mut world = World::new();
 
     world.register_component::<TransformComponent>();
@@ -59,7 +70,23 @@ fn renderer_initializes_and_renders_without_panic_offscreen() {
     );
     world.add_component(entity4, ColorComponent { r: 1.0, g: 1.0, b: 0.0, a: 0.5 });
 
-    let mut renderer = pollster::block_on(Renderer::new(1024, 768));
+    let mut renderer = pollster::block_on(Renderer::new(&window)).unwrap();
 
-    renderer.render(&world);
+    match renderer.render(&window, &world) {
+        Ok(_) => {}
+        Err(wgpu::SurfaceError::Lost) => {
+            // Reconfigure the surface if it's lost.
+            // In a real app, you'd handle this more gracefully.
+            let size = window.inner_size();
+            renderer.resize(size);
+        }
+        Err(wgpu::SurfaceError::OutOfMemory) => {
+            // Handle out-of-memory error.
+            panic!("GPU out of memory!");
+        }
+        Err(e) => {
+            // Other errors.
+            eprintln!("Error rendering frame: {:?}", e);
+        }
+    }
 }

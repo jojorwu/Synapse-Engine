@@ -3,11 +3,40 @@ use crate::ecs::World;
 use crate::ecs::components::{ColorComponent, RectangleComponent, TransformComponent};
 use glam::{Mat4, Vec3};
 use wgpu::util::DeviceExt;
+use egui;
+use egui_wgpu;
+use egui_winit;
+use winit::window::Window;
+use thiserror::Error;
+
+#[derive(Error, Debug)]
+pub enum RendererError {
+    #[error("Failed to create wgpu surface")]
+    CreateSurface(#[from] wgpu::CreateSurfaceError),
+    #[error("No suitable adapter found")]
+    NoAdapter,
+    #[error("Failed to get device")]
+    GetDevice(#[from] wgpu::RequestDeviceError),
+}
+
+pub struct RendererSettings {
+    pub light_position: [f32; 3],
+    pub light_color: [f32; 3],
+}
 
 #[repr(C)]
 #[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 struct CameraUniform {
     view_proj: [[f32; 4]; 4],
+}
+
+#[repr(C)]
+#[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct LightUniform {
+    position: [f32; 3],
+    _padding: u32,
+    color: [f32; 3],
+    _padding2: u32,
 }
 
 struct DepthTexture {
@@ -16,26 +45,31 @@ struct DepthTexture {
     sampler: wgpu::Sampler,
 }
 
-pub struct Renderer {
+pub struct Renderer<'a> {
+    instance: wgpu::Instance,
+    surface: wgpu::Surface<'a>,
     device: wgpu::Device,
     queue: wgpu::Queue,
+    config: wgpu::SurfaceConfiguration,
     render_pipeline: wgpu::RenderPipeline,
-    width: u32,
-    height: u32,
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
+    light_buffer: wgpu::Buffer,
+    light_bind_group: wgpu::BindGroup,
     depth_texture: DepthTexture,
     mesh: Mesh,
     instance_buffer: wgpu::Buffer,
     instances: Vec<InstanceRaw>,
-    texture: wgpu::Texture,
-    view: wgpu::TextureView,
     render_pipeline_2d: wgpu::RenderPipeline,
     camera_buffer_2d: wgpu::Buffer,
     camera_bind_group_2d: wgpu::BindGroup,
     vertex_buffer_2d: wgpu::Buffer,
     color_buffer_2d: wgpu::Buffer,
     num_vertices_2d: u32,
+    egui_context: egui::Context,
+    egui_winit_state: egui_winit::State,
+    egui_renderer: egui_wgpu::Renderer,
+    pub settings: RendererSettings,
 }
 
 struct Mesh {
@@ -48,6 +82,7 @@ struct Mesh {
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 struct Vertex {
     position: [f32; 3],
+    normal: [f32; 3],
 }
 
 #[repr(C)]
@@ -57,21 +92,24 @@ struct InstanceRaw {
     color: [f32; 4],
 }
 
-impl Renderer {
-    pub async fn new(width: u32, height: u32) -> Self {
+impl<'a> Renderer<'a> {
+    pub async fn new(window: &'a Window) -> Result<Self, RendererError> {
+        let size = window.inner_size();
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::all(),
             ..Default::default()
         });
 
+        let surface = instance.create_surface(window)?;
+
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::default(),
-                compatible_surface: None,
+                compatible_surface: Some(&surface),
                 force_fallback_adapter: false,
             })
             .await
-            .unwrap();
+            .ok_or(RendererError::NoAdapter)?;
 
         let (device, queue) = adapter
             .request_device(
@@ -82,10 +120,25 @@ impl Renderer {
                 },
                 None, // Trace path
             )
-            .await
-            .unwrap();
+            .await?;
 
-        let texture_format = wgpu::TextureFormat::Rgba8UnormSrgb;
+        let caps = surface.get_capabilities(&adapter);
+        let texture_format = caps.formats.iter()
+            .copied()
+            .find(|f| f.is_srgb())
+            .unwrap_or(caps.formats[0]);
+
+        let config = wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format: texture_format,
+            width: size.width,
+            height: size.height,
+            present_mode: caps.present_modes[0],
+            alpha_mode: caps.alpha_modes[0],
+            view_formats: vec![],
+            desired_maximum_frame_latency: 2,
+        };
+        surface.configure(&device, &config);
 
         let camera_uniform = CameraUniform {
             view_proj: Mat4::IDENTITY.to_cols_array_2d(),
@@ -101,7 +154,7 @@ impl Renderer {
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 entries: &[wgpu::BindGroupLayoutEntry {
                     binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
@@ -121,6 +174,43 @@ impl Renderer {
             label: Some("camera_bind_group"),
         });
 
+        let light_uniform = LightUniform {
+            position: [2.0, 2.0, 2.0],
+            _padding: 0,
+            color: [1.0, 1.0, 1.0],
+            _padding2: 0,
+        };
+
+        let light_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Light Buffer"),
+            contents: bytemuck::cast_slice(&[light_uniform]),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
+        let light_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                }],
+                label: Some("light_bind_group_layout"),
+            });
+
+        let light_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            layout: &light_bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: light_buffer.as_entire_binding(),
+            }],
+            label: Some("light_bind_group"),
+        });
+
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
@@ -129,7 +219,7 @@ impl Renderer {
         let render_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("Render Pipeline Layout"),
-                bind_group_layouts: &[&camera_bind_group_layout],
+                bind_group_layouts: &[&camera_bind_group_layout, &light_bind_group_layout],
                 push_constant_ranges: &[],
             });
 
@@ -143,12 +233,12 @@ impl Renderer {
                     wgpu::VertexBufferLayout {
                         array_stride: std::mem::size_of::<Vertex>() as wgpu::BufferAddress,
                         step_mode: wgpu::VertexStepMode::Vertex,
-                        attributes: &wgpu::vertex_attr_array![0 => Float32x3],
+                        attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3],
                     },
                     wgpu::VertexBufferLayout {
                         array_stride: std::mem::size_of::<InstanceRaw>() as wgpu::BufferAddress,
                         step_mode: wgpu::VertexStepMode::Instance,
-                        attributes: &wgpu::vertex_attr_array![1 => Float32x4, 2 => Float32x4, 3 => Float32x4, 4 => Float32x4, 5 => Float32x4],
+                        attributes: &wgpu::vertex_attr_array![2 => Float32x4, 3 => Float32x4, 4 => Float32x4, 5 => Float32x4, 6 => Float32x4],
                     },
                 ],
             },
@@ -156,7 +246,7 @@ impl Renderer {
                 module: &shader,
                 entry_point: "fs_main",
                 targets: &[Some(wgpu::ColorTargetState {
-                    format: texture_format,
+                    format: config.format,
                     blend: Some(wgpu::BlendState::REPLACE),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
@@ -185,25 +275,47 @@ impl Renderer {
             multiview: None,
         });
 
-        let depth_texture = DepthTexture::new(&device, width, height);
+        let depth_texture = DepthTexture::new(&device, config.width, config.height);
 
         let vertices = &[
-            Vertex { position: [-0.5, -0.5, 0.5] },
-            Vertex { position: [0.5, -0.5, 0.5] },
-            Vertex { position: [0.5, 0.5, 0.5] },
-            Vertex { position: [-0.5, 0.5, 0.5] },
-            Vertex { position: [-0.5, -0.5, -0.5] },
-            Vertex { position: [0.5, -0.5, -0.5] },
-            Vertex { position: [0.5, 0.5, -0.5] },
-            Vertex { position: [-0.5, 0.5, -0.5] },
+            // Front
+            Vertex { position: [-0.5, -0.5, 0.5], normal: [0.0, 0.0, 1.0] },
+            Vertex { position: [0.5, -0.5, 0.5], normal: [0.0, 0.0, 1.0] },
+            Vertex { position: [0.5, 0.5, 0.5], normal: [0.0, 0.0, 1.0] },
+            Vertex { position: [-0.5, 0.5, 0.5], normal: [0.0, 0.0, 1.0] },
+            // Back
+            Vertex { position: [-0.5, -0.5, -0.5], normal: [0.0, 0.0, -1.0] },
+            Vertex { position: [0.5, -0.5, -0.5], normal: [0.0, 0.0, -1.0] },
+            Vertex { position: [0.5, 0.5, -0.5], normal: [0.0, 0.0, -1.0] },
+            Vertex { position: [-0.5, 0.5, -0.5], normal: [0.0, 0.0, -1.0] },
+            // Right
+            Vertex { position: [0.5, -0.5, 0.5], normal: [1.0, 0.0, 0.0] },
+            Vertex { position: [0.5, -0.5, -0.5], normal: [1.0, 0.0, 0.0] },
+            Vertex { position: [0.5, 0.5, -0.5], normal: [1.0, 0.0, 0.0] },
+            Vertex { position: [0.5, 0.5, 0.5], normal: [1.0, 0.0, 0.0] },
+            // Left
+            Vertex { position: [-0.5, -0.5, 0.5], normal: [-1.0, 0.0, 0.0] },
+            Vertex { position: [-0.5, -0.5, -0.5], normal: [-1.0, 0.0, 0.0] },
+            Vertex { position: [-0.5, 0.5, -0.5], normal: [-1.0, 0.0, 0.0] },
+            Vertex { position: [-0.5, 0.5, 0.5], normal: [-1.0, 0.0, 0.0] },
+            // Top
+            Vertex { position: [-0.5, 0.5, 0.5], normal: [0.0, 1.0, 0.0] },
+            Vertex { position: [0.5, 0.5, 0.5], normal: [0.0, 1.0, 0.0] },
+            Vertex { position: [0.5, 0.5, -0.5], normal: [0.0, 1.0, 0.0] },
+            Vertex { position: [-0.5, 0.5, -0.5], normal: [0.0, 1.0, 0.0] },
+            // Bottom
+            Vertex { position: [-0.5, -0.5, 0.5], normal: [0.0, -1.0, 0.0] },
+            Vertex { position: [0.5, -0.5, 0.5], normal: [0.0, -1.0, 0.0] },
+            Vertex { position: [0.5, -0.5, -0.5], normal: [0.0, -1.0, 0.0] },
+            Vertex { position: [-0.5, -0.5, -0.5], normal: [0.0, -1.0, 0.0] },
         ];
         let indices: &[u16] = &[
-            0, 1, 2, 2, 3, 0, // front
-            1, 5, 6, 6, 2, 1, // right
-            5, 4, 7, 7, 6, 5, // back
-            4, 0, 3, 3, 7, 4, // left
-            3, 2, 6, 6, 7, 3, // top
-            4, 5, 1, 1, 0, 4, // bottom
+            0, 1, 2, 2, 3, 0,
+            4, 5, 6, 6, 7, 4,
+            8, 9, 10, 10, 11, 8,
+            12, 13, 14, 14, 15, 12,
+            16, 17, 18, 18, 19, 16,
+            20, 21, 22, 22, 23, 20,
         ];
 
         let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -230,7 +342,7 @@ impl Renderer {
         });
 
         let camera_uniform_2d = CameraUniform {
-            view_proj: Mat4::orthographic_rh_gl(0.0, width as f32, height as f32, 0.0, -1.0, 1.0)
+            view_proj: Mat4::orthographic_rh_gl(0.0, config.width as f32, config.height as f32, 0.0, -1.0, 1.0)
                 .to_cols_array_2d(),
         };
 
@@ -294,7 +406,7 @@ impl Renderer {
                     module: &shader_2d,
                     entry_point: "fs_main",
                     targets: &[Some(wgpu::ColorTargetState {
-                        format: texture_format,
+                        format: config.format,
                         blend: Some(wgpu::BlendState::ALPHA_BLENDING),
                         write_mask: wgpu::ColorWrites::ALL,
                     })],
@@ -316,23 +428,6 @@ impl Renderer {
             mapped_at_creation: false,
         });
 
-        let texture_desc = wgpu::TextureDescriptor {
-            size: wgpu::Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8UnormSrgb,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-            label: None,
-            view_formats: &[],
-        };
-        let texture = device.create_texture(&texture_desc);
-        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-
         let vertex_buffer_2d = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Vertex Buffer 2D"),
             size: 0,
@@ -347,30 +442,59 @@ impl Renderer {
             mapped_at_creation: false,
         });
 
-        Self {
+        let egui_context = egui::Context::default();
+        let egui_winit_state = egui_winit::State::new(egui_context.clone(), egui::ViewportId::ROOT, &window, None, None);
+        let egui_renderer = egui_wgpu::Renderer::new(&device, config.format, None, 1);
+
+        let settings = RendererSettings {
+            light_position: light_uniform.position,
+            light_color: light_uniform.color,
+        };
+
+        Ok(Self {
+            instance,
+            surface,
             device,
             queue,
+            config,
             render_pipeline,
-            width,
-            height,
             camera_buffer,
             camera_bind_group,
+            light_buffer,
+            light_bind_group,
             depth_texture,
             mesh,
             instance_buffer,
             instances,
-            texture,
-            view,
             render_pipeline_2d,
             camera_buffer_2d,
             camera_bind_group_2d,
             vertex_buffer_2d,
             color_buffer_2d,
             num_vertices_2d: 0,
+            egui_context,
+            egui_winit_state,
+            egui_renderer,
+            settings,
+        })
+    }
+
+    pub fn handle_event(&mut self, window: &Window, event: &winit::event::WindowEvent) -> bool {
+        self.egui_winit_state.on_window_event(window, event).consumed
+    }
+
+    pub fn resize(&mut self, new_size: winit::dpi::PhysicalSize<u32>) {
+        if new_size.width > 0 && new_size.height > 0 {
+            self.config.width = new_size.width;
+            self.config.height = new_size.height;
+            self.surface.configure(&self.device, &self.config);
+            self.depth_texture = DepthTexture::new(&self.device, self.config.width, self.config.height);
         }
     }
 
-    pub fn render(&mut self, world: &World) {
+    pub fn render(&mut self, window: &Window, world: &World) -> Result<(), wgpu::SurfaceError> {
+        let output = self.surface.get_current_texture()?;
+        let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
 
         let mut encoder = self
             .device
@@ -381,7 +505,7 @@ impl Renderer {
         let camera_uniform = CameraUniform {
             view_proj: (Mat4::perspective_rh_gl(
                 45.0f32.to_radians(),
-                self.width as f32 / self.height as f32,
+                self.config.width as f32 / self.config.height as f32,
                 0.1,
                 100.0,
             ) * Mat4::look_at_rh(
@@ -395,6 +519,18 @@ impl Renderer {
             &self.camera_buffer,
             0,
             bytemuck::cast_slice(&[camera_uniform]),
+        );
+
+        let light_uniform = LightUniform {
+            position: self.settings.light_position,
+            _padding: 0,
+            color: self.settings.light_color,
+            _padding2: 0,
+        };
+        self.queue.write_buffer(
+            &self.light_buffer,
+            0,
+            bytemuck::cast_slice(&[light_uniform]),
         );
 
         let transform_id = world.get_component_id::<TransformComponent>().unwrap();
@@ -451,7 +587,7 @@ impl Renderer {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Render Pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &self.view,
+                    view: &view,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
@@ -477,6 +613,7 @@ impl Renderer {
 
             render_pass.set_pipeline(&self.render_pipeline);
             render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
+            render_pass.set_bind_group(1, &self.light_bind_group, &[]);
             render_pass.set_vertex_buffer(0, self.mesh.vertex_buffer.slice(..));
             render_pass.set_vertex_buffer(1, self.instance_buffer.slice(..));
             render_pass.set_index_buffer(self.mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
@@ -563,7 +700,7 @@ impl Renderer {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Render Pass 2D"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &self.view,
+                    view: &view,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Load,
@@ -582,7 +719,65 @@ impl Renderer {
             render_pass.draw(0..self.num_vertices_2d, 0..1);
         }
 
+        let raw_input = self.egui_winit_state.take_egui_input(window);
+        let full_output = self.egui_context.run(raw_input, |ctx| {
+            egui::Window::new("Dev Panel").show(ctx, |ui| {
+                ui.label(format!("Entity count: {}", world.entity_map.len()));
+            });
+
+            egui::Window::new("Render Settings").show(ctx, |ui| {
+                ui.label("Light Position");
+                ui.add(egui::Slider::new(&mut self.settings.light_position[0], -10.0..=10.0).text("X"));
+                ui.add(egui::Slider::new(&mut self.settings.light_position[1], -10.0..=10.0).text("Y"));
+                ui.add(egui::Slider::new(&mut self.settings.light_position[2], -10.0..=10.0).text("Z"));
+
+                ui.label("Light Color");
+                ui.color_edit_button_rgb(&mut self.settings.light_color);
+            });
+        });
+
+        self.egui_winit_state.handle_platform_output(window, full_output.platform_output);
+
+        let screen_descriptor = egui_wgpu::ScreenDescriptor {
+            size_in_pixels: [self.config.width, self.config.height],
+            pixels_per_point: window.scale_factor() as f32,
+        };
+
+        let clipped_primitives = self.egui_context.tessellate(full_output.shapes, screen_descriptor.pixels_per_point);
+
+        for (id, image_delta) in &full_output.textures_delta.set {
+            self.egui_renderer.update_texture(&self.device, &self.queue, *id, image_delta);
+        }
+        for id in &full_output.textures_delta.free {
+            self.egui_renderer.free_texture(id);
+        }
+
+        self.egui_renderer.update_buffers(&self.device, &self.queue, &mut encoder, &clipped_primitives, &screen_descriptor);
+
+        {
+            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Egui Render Pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                occlusion_query_set: None,
+                timestamp_writes: None,
+            });
+
+            self.egui_renderer.render(&mut render_pass, &clipped_primitives, &screen_descriptor);
+        }
+
         self.queue.submit(std::iter::once(encoder.finish()));
+
+        output.present();
+
+        Ok(())
     }
 }
 
