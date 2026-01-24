@@ -25,6 +25,15 @@ struct CameraUniform {
     view_proj: [[f32; 4]; 4],
 }
 
+#[repr(C)]
+#[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct LightUniform {
+    position: [f32; 3],
+    _padding: u32,
+    color: [f32; 3],
+    _padding2: u32,
+}
+
 struct DepthTexture {
     texture: wgpu::Texture,
     view: wgpu::TextureView,
@@ -40,6 +49,8 @@ pub struct Renderer<'a> {
     render_pipeline: wgpu::RenderPipeline,
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
+    light_buffer: wgpu::Buffer,
+    light_bind_group: wgpu::BindGroup,
     depth_texture: DepthTexture,
     mesh: Mesh,
     instance_buffer: wgpu::Buffer,
@@ -65,6 +76,7 @@ struct Mesh {
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 struct Vertex {
     position: [f32; 3],
+    normal: [f32; 3],
 }
 
 #[repr(C)]
@@ -136,7 +148,7 @@ impl<'a> Renderer<'a> {
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 entries: &[wgpu::BindGroupLayoutEntry {
                     binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
@@ -156,6 +168,43 @@ impl<'a> Renderer<'a> {
             label: Some("camera_bind_group"),
         });
 
+        let light_uniform = LightUniform {
+            position: [2.0, 2.0, 2.0],
+            _padding: 0,
+            color: [1.0, 1.0, 1.0],
+            _padding2: 0,
+        };
+
+        let light_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Light Buffer"),
+            contents: bytemuck::cast_slice(&[light_uniform]),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
+        let light_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                }],
+                label: Some("light_bind_group_layout"),
+            });
+
+        let light_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            layout: &light_bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: light_buffer.as_entire_binding(),
+            }],
+            label: Some("light_bind_group"),
+        });
+
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
@@ -164,7 +213,7 @@ impl<'a> Renderer<'a> {
         let render_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("Render Pipeline Layout"),
-                bind_group_layouts: &[&camera_bind_group_layout],
+                bind_group_layouts: &[&camera_bind_group_layout, &light_bind_group_layout],
                 push_constant_ranges: &[],
             });
 
@@ -178,12 +227,12 @@ impl<'a> Renderer<'a> {
                     wgpu::VertexBufferLayout {
                         array_stride: std::mem::size_of::<Vertex>() as wgpu::BufferAddress,
                         step_mode: wgpu::VertexStepMode::Vertex,
-                        attributes: &wgpu::vertex_attr_array![0 => Float32x3],
+                        attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3],
                     },
                     wgpu::VertexBufferLayout {
                         array_stride: std::mem::size_of::<InstanceRaw>() as wgpu::BufferAddress,
                         step_mode: wgpu::VertexStepMode::Instance,
-                        attributes: &wgpu::vertex_attr_array![1 => Float32x4, 2 => Float32x4, 3 => Float32x4, 4 => Float32x4, 5 => Float32x4],
+                        attributes: &wgpu::vertex_attr_array![2 => Float32x4, 3 => Float32x4, 4 => Float32x4, 5 => Float32x4, 6 => Float32x4],
                     },
                 ],
             },
@@ -223,22 +272,44 @@ impl<'a> Renderer<'a> {
         let depth_texture = DepthTexture::new(&device, config.width, config.height);
 
         let vertices = &[
-            Vertex { position: [-0.5, -0.5, 0.5] },
-            Vertex { position: [0.5, -0.5, 0.5] },
-            Vertex { position: [0.5, 0.5, 0.5] },
-            Vertex { position: [-0.5, 0.5, 0.5] },
-            Vertex { position: [-0.5, -0.5, -0.5] },
-            Vertex { position: [0.5, -0.5, -0.5] },
-            Vertex { position: [0.5, 0.5, -0.5] },
-            Vertex { position: [-0.5, 0.5, -0.5] },
+            // Front
+            Vertex { position: [-0.5, -0.5, 0.5], normal: [0.0, 0.0, 1.0] },
+            Vertex { position: [0.5, -0.5, 0.5], normal: [0.0, 0.0, 1.0] },
+            Vertex { position: [0.5, 0.5, 0.5], normal: [0.0, 0.0, 1.0] },
+            Vertex { position: [-0.5, 0.5, 0.5], normal: [0.0, 0.0, 1.0] },
+            // Back
+            Vertex { position: [-0.5, -0.5, -0.5], normal: [0.0, 0.0, -1.0] },
+            Vertex { position: [0.5, -0.5, -0.5], normal: [0.0, 0.0, -1.0] },
+            Vertex { position: [0.5, 0.5, -0.5], normal: [0.0, 0.0, -1.0] },
+            Vertex { position: [-0.5, 0.5, -0.5], normal: [0.0, 0.0, -1.0] },
+            // Right
+            Vertex { position: [0.5, -0.5, 0.5], normal: [1.0, 0.0, 0.0] },
+            Vertex { position: [0.5, -0.5, -0.5], normal: [1.0, 0.0, 0.0] },
+            Vertex { position: [0.5, 0.5, -0.5], normal: [1.0, 0.0, 0.0] },
+            Vertex { position: [0.5, 0.5, 0.5], normal: [1.0, 0.0, 0.0] },
+            // Left
+            Vertex { position: [-0.5, -0.5, 0.5], normal: [-1.0, 0.0, 0.0] },
+            Vertex { position: [-0.5, -0.5, -0.5], normal: [-1.0, 0.0, 0.0] },
+            Vertex { position: [-0.5, 0.5, -0.5], normal: [-1.0, 0.0, 0.0] },
+            Vertex { position: [-0.5, 0.5, 0.5], normal: [-1.0, 0.0, 0.0] },
+            // Top
+            Vertex { position: [-0.5, 0.5, 0.5], normal: [0.0, 1.0, 0.0] },
+            Vertex { position: [0.5, 0.5, 0.5], normal: [0.0, 1.0, 0.0] },
+            Vertex { position: [0.5, 0.5, -0.5], normal: [0.0, 1.0, 0.0] },
+            Vertex { position: [-0.5, 0.5, -0.5], normal: [0.0, 1.0, 0.0] },
+            // Bottom
+            Vertex { position: [-0.5, -0.5, 0.5], normal: [0.0, -1.0, 0.0] },
+            Vertex { position: [0.5, -0.5, 0.5], normal: [0.0, -1.0, 0.0] },
+            Vertex { position: [0.5, -0.5, -0.5], normal: [0.0, -1.0, 0.0] },
+            Vertex { position: [-0.5, -0.5, -0.5], normal: [0.0, -1.0, 0.0] },
         ];
         let indices: &[u16] = &[
-            0, 1, 2, 2, 3, 0, // front
-            1, 5, 6, 6, 2, 1, // right
-            5, 4, 7, 7, 6, 5, // back
-            4, 0, 3, 3, 7, 4, // left
-            3, 2, 6, 6, 7, 3, // top
-            4, 5, 1, 1, 0, 4, // bottom
+            0, 1, 2, 2, 3, 0,
+            4, 5, 6, 6, 7, 4,
+            8, 9, 10, 10, 11, 8,
+            12, 13, 14, 14, 15, 12,
+            16, 17, 18, 18, 19, 16,
+            20, 21, 22, 22, 23, 20,
         ];
 
         let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -378,6 +449,8 @@ impl<'a> Renderer<'a> {
             render_pipeline,
             camera_buffer,
             camera_bind_group,
+            light_buffer,
+            light_bind_group,
             depth_texture,
             mesh,
             instance_buffer,
@@ -516,6 +589,7 @@ impl<'a> Renderer<'a> {
 
             render_pass.set_pipeline(&self.render_pipeline);
             render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
+            render_pass.set_bind_group(1, &self.light_bind_group, &[]);
             render_pass.set_vertex_buffer(0, self.mesh.vertex_buffer.slice(..));
             render_pass.set_vertex_buffer(1, self.instance_buffer.slice(..));
             render_pass.set_index_buffer(self.mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
