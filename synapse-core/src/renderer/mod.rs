@@ -1,6 +1,9 @@
 
+pub mod culling;
+
 use crate::ecs::World;
 use crate::ecs::components::{ColorComponent, RectangleComponent, TransformComponent};
+use crate::renderer::culling::Frustum;
 use glam::{Mat4, Vec3};
 use wgpu::util::DeviceExt;
 use egui;
@@ -502,18 +505,18 @@ impl<'a> Renderer<'a> {
                 label: Some("Render Encoder"),
             });
 
+        let view_proj_matrix = Mat4::perspective_rh_gl(
+            45.0f32.to_radians(),
+            self.config.width as f32 / self.config.height as f32,
+            0.1,
+            100.0,
+        ) * Mat4::look_at_rh(
+            Vec3::new(0.0, 1.0, 3.0),
+            Vec3::ZERO,
+            Vec3::Y,
+        );
         let camera_uniform = CameraUniform {
-            view_proj: (Mat4::perspective_rh_gl(
-                45.0f32.to_radians(),
-                self.config.width as f32 / self.config.height as f32,
-                0.1,
-                100.0,
-            ) * Mat4::look_at_rh(
-                Vec3::new(0.0, 1.0, 3.0),
-                Vec3::ZERO,
-                Vec3::Y,
-            ))
-            .to_cols_array_2d(),
+            view_proj: view_proj_matrix.to_cols_array_2d(),
         };
         self.queue.write_buffer(
             &self.camera_buffer,
@@ -533,6 +536,7 @@ impl<'a> Renderer<'a> {
             bytemuck::cast_slice(&[light_uniform]),
         );
 
+        let frustum = Frustum::from_matrix(&view_proj_matrix);
         let transform_id = world.get_component_id::<TransformComponent>().unwrap();
         let color_id = world.get_component_id::<ColorComponent>().unwrap();
 
@@ -561,10 +565,16 @@ impl<'a> Renderer<'a> {
                 };
 
                 for (i, transform) in transforms.iter().enumerate() {
-                    self.instances.push(InstanceRaw {
-                        model: transform.to_matrix().to_cols_array_2d(),
-                        color: [colors[i].r, colors[i].g, colors[i].b, colors[i].a],
-                    });
+                    let position = Vec3::from(transform.position);
+                    let scale = Vec3::from(transform.scale);
+                    let radius = scale.x.max(scale.y).max(scale.z);
+
+                    if frustum.is_sphere_visible(position, radius) {
+                        self.instances.push(InstanceRaw {
+                            model: transform.to_matrix().to_cols_array_2d(),
+                            color: [colors[i].r, colors[i].g, colors[i].b, colors[i].a],
+                        });
+                    }
                 }
             }
         }
