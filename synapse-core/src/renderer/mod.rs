@@ -32,6 +32,8 @@ pub struct RendererSettings {
 #[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 struct CameraUniform {
     view_proj: [[f32; 4]; 4],
+    position: [f32; 3],
+    _padding: u32,
 }
 
 #[repr(C)]
@@ -41,6 +43,7 @@ struct LightUniform {
     _padding: u32,
     color: [f32; 3],
     _padding2: u32,
+    light_view_proj: [[f32; 4]; 4],
 }
 
 struct DepthTexture {
@@ -62,8 +65,6 @@ pub struct Renderer<'a> {
     camera_bind_group: wgpu::BindGroup,
     light_buffer: wgpu::Buffer,
     light_bind_group: wgpu::BindGroup,
-    light_view_buffer: wgpu::Buffer,
-    light_view_bind_group: wgpu::BindGroup,
     depth_texture: DepthTexture,
     shadow_texture: wgpu::Texture,
     shadow_view: wgpu::TextureView,
@@ -154,6 +155,8 @@ impl<'a> Renderer<'a> {
 
         let camera_uniform = CameraUniform {
             view_proj: Mat4::IDENTITY.to_cols_array_2d(),
+            position: [0.0; 3],
+            _padding: 0,
         };
 
         let camera_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -191,6 +194,7 @@ impl<'a> Renderer<'a> {
             _padding: 0,
             color: [1.0, 1.0, 1.0],
             _padding2: 0,
+            light_view_proj: Mat4::IDENTITY.to_cols_array_2d(),
         };
 
         let light_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -412,6 +416,8 @@ impl<'a> Renderer<'a> {
         let camera_uniform_2d = CameraUniform {
             view_proj: Mat4::orthographic_rh_gl(0.0, config.width as f32, config.height as f32, 0.0, -1.0, 1.0)
                 .to_cols_array_2d(),
+            position: [0.0; 3],
+            _padding: 0,
         };
 
         let camera_buffer_2d = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -512,33 +518,23 @@ impl<'a> Renderer<'a> {
 
         let egui_context = egui::Context::default();
         let egui_winit_state = egui_winit::State::new(egui_context.clone(), egui::ViewportId::ROOT, &window, None, None);
-        let egui_renderer = egui_wgpu::Renderer::new(&device, config.format, None, 1);
-
-        let light_view_uniform = CameraUniform {
-            view_proj: Mat4::IDENTITY.to_cols_array_2d(),
-        };
-        let light_view_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Light View Buffer"),
-            contents: bytemuck::cast_slice(&[light_view_uniform]),
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        });
-        let light_view_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            layout: &camera_bind_group_layout, // Reuse the same layout
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: light_view_buffer.as_entire_binding(),
-            }],
-            label: Some("light_view_bind_group"),
-        });
+        let egui_renderer = egui_wgpu::Renderer::new(&*device, config.format, None, 1);
 
         let depth_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Depth Shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("depth_only.wgsl").into()),
         });
 
+        let shadow_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Shadow Pipeline Layout"),
+                bind_group_layouts: &[&camera_bind_group_layout],
+                push_constant_ranges: &[],
+            });
+
         let depth_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("Depth Pipeline"),
-            layout: Some(&render_pipeline_layout), // Reuse the same layout as main render
+            layout: Some(&shadow_pipeline_layout), // Reuse the same layout as shadow
             vertex: wgpu::VertexState {
                 module: &depth_shader,
                 entry_point: "vs_main",
@@ -579,13 +575,6 @@ impl<'a> Renderer<'a> {
             },
             multiview: None,
         });
-
-        let shadow_pipeline_layout =
-            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("Shadow Pipeline Layout"),
-                bind_group_layouts: &[&camera_bind_group_layout],
-                push_constant_ranges: &[],
-            });
 
         let shadow_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("Shadow Pipeline"),
@@ -653,8 +642,6 @@ impl<'a> Renderer<'a> {
             camera_bind_group,
             light_buffer,
             light_bind_group,
-            light_view_buffer,
-            light_view_bind_group,
             depth_texture,
             shadow_texture,
             shadow_view,
@@ -698,35 +685,26 @@ impl<'a> Renderer<'a> {
                 label: Some("Render Encoder"),
             });
 
+        let camera_position = Vec3::new(0.0, 1.0, 3.0);
         let view_proj_matrix = Mat4::perspective_rh_gl(
             45.0f32.to_radians(),
             self.config.width as f32 / self.config.height as f32,
             0.1,
             100.0,
         ) * Mat4::look_at_rh(
-            Vec3::new(0.0, 1.0, 3.0),
+            camera_position,
             Vec3::ZERO,
             Vec3::Y,
         );
         let camera_uniform = CameraUniform {
             view_proj: view_proj_matrix.to_cols_array_2d(),
+            position: camera_position.into(),
+            _padding: 0,
         };
         self.queue.write_buffer(
             &self.camera_buffer,
             0,
             bytemuck::cast_slice(&[camera_uniform]),
-        );
-
-        let light_uniform = LightUniform {
-            position: self.settings.light_position,
-            _padding: 0,
-            color: self.settings.light_color,
-            _padding2: 0,
-        };
-        self.queue.write_buffer(
-            &self.light_buffer,
-            0,
-            bytemuck::cast_slice(&[light_uniform]),
         );
 
         let light_proj = Mat4::orthographic_rh_gl(-10.0, 10.0, -10.0, 10.0, 1.0, 20.0);
@@ -736,13 +714,18 @@ impl<'a> Renderer<'a> {
             Vec3::Y,
         );
         let light_view_proj = light_proj * light_view;
-        let light_view_uniform = CameraUniform {
-            view_proj: light_view_proj.to_cols_array_2d(),
+
+        let light_uniform = LightUniform {
+            position: self.settings.light_position,
+            _padding: 0,
+            color: self.settings.light_color,
+            _padding2: 0,
+            light_view_proj: light_view_proj.to_cols_array_2d(),
         };
         self.queue.write_buffer(
-            &self.light_view_buffer,
+            &self.light_buffer,
             0,
-            bytemuck::cast_slice(&[light_view_uniform]),
+            bytemuck::cast_slice(&[light_uniform]),
         );
 
         let frustum = Frustum::from_matrix(&view_proj_matrix);
@@ -817,8 +800,19 @@ impl<'a> Renderer<'a> {
                 occlusion_query_set: None,
                 timestamp_writes: None,
             });
+            let light_view_uniform = CameraUniform {
+                view_proj: light_view_proj.to_cols_array_2d(),
+                position: self.settings.light_position,
+                _padding: 0,
+            };
+            self.queue.write_buffer(
+                &self.camera_buffer,
+                0,
+                bytemuck::cast_slice(&[light_view_uniform]),
+            );
+
             shadow_pass.set_pipeline(&self.shadow_pipeline);
-            shadow_pass.set_bind_group(0, &self.light_view_bind_group, &[]);
+            shadow_pass.set_bind_group(0, &self.camera_bind_group, &[]);
             shadow_pass.set_vertex_buffer(0, self.mesh.vertex_buffer.slice(..));
             shadow_pass.set_vertex_buffer(1, self.instance_buffer.slice(..));
             shadow_pass.set_index_buffer(self.mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
