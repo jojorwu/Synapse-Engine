@@ -21,23 +21,30 @@ var shadow_map: texture_depth_2d;
 @group(1) @binding(2)
 var shadow_sampler: sampler_comparison;
 
+@group(2) @binding(0)
+var t_diffuse: texture_2d<f32>;
+@group(2) @binding(1)
+var s_diffuse: sampler;
+
 struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
     @location(0) color: vec4<f32>,
     @location(1) normal: vec3<f32>,
     @location(2) world_position: vec3<f32>,
     @location(3) shadow_pos: vec4<f32>,
+    @location(4) uv: vec2<f32>,
 };
 
 @vertex
 fn vs_main(
     @location(0) position: vec3<f32>,
     @location(1) normal: vec3<f32>,
-    @location(2) model_matrix_0: vec4<f32>,
-    @location(3) model_matrix_1: vec4<f32>,
-    @location(4) model_matrix_2: vec4<f32>,
-    @location(5) model_matrix_3: vec4<f32>,
-    @location(6) color: vec4<f32>,
+    @location(2) uv: vec2<f32>,
+    @location(3) model_matrix_0: vec4<f32>,
+    @location(4) model_matrix_1: vec4<f32>,
+    @location(5) model_matrix_2: vec4<f32>,
+    @location(6) model_matrix_3: vec4<f32>,
+    @location(7) color: vec4<f32>,
 ) -> VertexOutput {
     var out: VertexOutput;
     let model_matrix = mat4x4<f32>(
@@ -52,6 +59,7 @@ fn vs_main(
     out.normal = (model_matrix * vec4<f32>(normal, 0.0)).xyz;
     out.color = color;
     out.shadow_pos = light.light_view_proj * world_position;
+    out.uv = uv;
     return out;
 }
 
@@ -87,6 +95,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let spec = pow(max(dot(normal, halfway_dir), 0.0), 32.0);
     let specular_color = light.color * specular_strength * spec * shadow;
 
-    let result = (ambient_color + diffuse_color + specular_color) * in.color.rgb;
+    let texture_color = textureSample(t_diffuse, s_diffuse, in.uv);
+    let result = (ambient_color + diffuse_color + specular_color) * in.color.rgb * texture_color.rgb;
     return vec4<f32>(result, in.color.a);
 }

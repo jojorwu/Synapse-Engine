@@ -9,9 +9,10 @@ use wgpu::util::DeviceExt;
 use egui;
 use egui_wgpu;
 use egui_winit;
+use image::GenericImageView;
 use std::sync::Arc;
-use winit::window::Window;
 use thiserror::Error;
+use winit::window::Window;
 
 #[derive(Error, Debug)]
 pub enum RendererError {
@@ -21,6 +22,8 @@ pub enum RendererError {
     NoAdapter,
     #[error("Failed to get device")]
     GetDevice(#[from] wgpu::RequestDeviceError),
+    #[error("Failed to load texture")]
+    TextureLoad(#[from] image::ImageError),
 }
 
 pub struct RendererSettings {
@@ -65,6 +68,8 @@ pub struct Renderer<'a> {
     camera_bind_group: wgpu::BindGroup,
     light_buffer: wgpu::Buffer,
     light_bind_group: wgpu::BindGroup,
+    texture_bind_group_layout: wgpu::BindGroupLayout,
+    diffuse_bind_group: wgpu::BindGroup,
     depth_texture: DepthTexture,
     shadow_texture: wgpu::Texture,
     shadow_view: wgpu::TextureView,
@@ -95,6 +100,7 @@ struct Mesh {
 struct Vertex {
     position: [f32; 3],
     normal: [f32; 3],
+    uv: [f32; 2],
 }
 
 #[repr(C)]
@@ -108,35 +114,35 @@ impl<'a> Renderer<'a> {
     fn create_mesh(device: &wgpu::Device) -> Mesh {
         let vertices = &[
             // Front
-            Vertex { position: [-0.5, -0.5, 0.5], normal: [0.0, 0.0, 1.0] },
-            Vertex { position: [0.5, -0.5, 0.5], normal: [0.0, 0.0, 1.0] },
-            Vertex { position: [0.5, 0.5, 0.5], normal: [0.0, 0.0, 1.0] },
-            Vertex { position: [-0.5, 0.5, 0.5], normal: [0.0, 0.0, 1.0] },
+            Vertex { position: [-0.5, -0.5, 0.5], normal: [0.0, 0.0, 1.0], uv: [0.0, 1.0] },
+            Vertex { position: [0.5, -0.5, 0.5], normal: [0.0, 0.0, 1.0], uv: [1.0, 1.0] },
+            Vertex { position: [0.5, 0.5, 0.5], normal: [0.0, 0.0, 1.0], uv: [1.0, 0.0] },
+            Vertex { position: [-0.5, 0.5, 0.5], normal: [0.0, 0.0, 1.0], uv: [0.0, 0.0] },
             // Back
-            Vertex { position: [-0.5, -0.5, -0.5], normal: [0.0, 0.0, -1.0] },
-            Vertex { position: [0.5, -0.5, -0.5], normal: [0.0, 0.0, -1.0] },
-            Vertex { position: [0.5, 0.5, -0.5], normal: [0.0, 0.0, -1.0] },
-            Vertex { position: [-0.5, 0.5, -0.5], normal: [0.0, 0.0, -1.0] },
+            Vertex { position: [-0.5, -0.5, -0.5], normal: [0.0, 0.0, -1.0], uv: [1.0, 1.0] },
+            Vertex { position: [0.5, -0.5, -0.5], normal: [0.0, 0.0, -1.0], uv: [0.0, 1.0] },
+            Vertex { position: [0.5, 0.5, -0.5], normal: [0.0, 0.0, -1.0], uv: [0.0, 0.0] },
+            Vertex { position: [-0.5, 0.5, -0.5], normal: [0.0, 0.0, -1.0], uv: [1.0, 0.0] },
             // Right
-            Vertex { position: [0.5, -0.5, 0.5], normal: [1.0, 0.0, 0.0] },
-            Vertex { position: [0.5, -0.5, -0.5], normal: [1.0, 0.0, 0.0] },
-            Vertex { position: [0.5, 0.5, -0.5], normal: [1.0, 0.0, 0.0] },
-            Vertex { position: [0.5, 0.5, 0.5], normal: [1.0, 0.0, 0.0] },
+            Vertex { position: [0.5, -0.5, 0.5], normal: [1.0, 0.0, 0.0], uv: [0.0, 1.0] },
+            Vertex { position: [0.5, -0.5, -0.5], normal: [1.0, 0.0, 0.0], uv: [1.0, 1.0] },
+            Vertex { position: [0.5, 0.5, -0.5], normal: [1.0, 0.0, 0.0], uv: [1.0, 0.0] },
+            Vertex { position: [0.5, 0.5, 0.5], normal: [1.0, 0.0, 0.0], uv: [0.0, 0.0] },
             // Left
-            Vertex { position: [-0.5, -0.5, 0.5], normal: [-1.0, 0.0, 0.0] },
-            Vertex { position: [-0.5, -0.5, -0.5], normal: [-1.0, 0.0, 0.0] },
-            Vertex { position: [-0.5, 0.5, -0.5], normal: [-1.0, 0.0, 0.0] },
-            Vertex { position: [-0.5, 0.5, 0.5], normal: [-1.0, 0.0, 0.0] },
+            Vertex { position: [-0.5, -0.5, 0.5], normal: [-1.0, 0.0, 0.0], uv: [1.0, 1.0] },
+            Vertex { position: [-0.5, -0.5, -0.5], normal: [-1.0, 0.0, 0.0], uv: [0.0, 1.0] },
+            Vertex { position: [-0.5, 0.5, -0.5], normal: [-1.0, 0.0, 0.0], uv: [0.0, 0.0] },
+            Vertex { position: [-0.5, 0.5, 0.5], normal: [-1.0, 0.0, 0.0], uv: [1.0, 0.0] },
             // Top
-            Vertex { position: [-0.5, 0.5, 0.5], normal: [0.0, 1.0, 0.0] },
-            Vertex { position: [0.5, 0.5, 0.5], normal: [0.0, 1.0, 0.0] },
-            Vertex { position: [0.5, 0.5, -0.5], normal: [0.0, 1.0, 0.0] },
-            Vertex { position: [-0.5, 0.5, -0.5], normal: [0.0, 1.0, 0.0] },
+            Vertex { position: [-0.5, 0.5, 0.5], normal: [0.0, 1.0, 0.0], uv: [0.0, 1.0] },
+            Vertex { position: [0.5, 0.5, 0.5], normal: [0.0, 1.0, 0.0], uv: [1.0, 1.0] },
+            Vertex { position: [0.5, 0.5, -0.5], normal: [0.0, 1.0, 0.0], uv: [1.0, 0.0] },
+            Vertex { position: [-0.5, 0.5, -0.5], normal: [0.0, 1.0, 0.0], uv: [0.0, 0.0] },
             // Bottom
-            Vertex { position: [-0.5, -0.5, 0.5], normal: [0.0, -1.0, 0.0] },
-            Vertex { position: [0.5, -0.5, 0.5], normal: [0.0, -1.0, 0.0] },
-            Vertex { position: [0.5, -0.5, -0.5], normal: [0.0, -1.0, 0.0] },
-            Vertex { position: [-0.5, -0.5, -0.5], normal: [0.0, -1.0, 0.0] },
+            Vertex { position: [-0.5, -0.5, 0.5], normal: [0.0, -1.0, 0.0], uv: [0.0, 0.0] },
+            Vertex { position: [0.5, -0.5, 0.5], normal: [0.0, -1.0, 0.0], uv: [1.0, 0.0] },
+            Vertex { position: [0.5, -0.5, -0.5], normal: [0.0, -1.0, 0.0], uv: [1.0, 1.0] },
+            Vertex { position: [-0.5, -0.5, -0.5], normal: [0.0, -1.0, 0.0], uv: [0.0, 1.0] },
         ];
         let indices: &[u16] = &[
             0, 1, 2, 2, 3, 0,
@@ -328,6 +334,7 @@ impl<'a> Renderer<'a> {
         config: &wgpu::SurfaceConfiguration,
         camera_bind_group_layout: &wgpu::BindGroupLayout,
         light_bind_group_layout: &wgpu::BindGroupLayout,
+        texture_bind_group_layout: &wgpu::BindGroupLayout,
         shadow_pipeline_layout: &wgpu::PipelineLayout,
         camera_bind_group_layout_2d: &wgpu::BindGroupLayout,
     ) -> (
@@ -344,7 +351,11 @@ impl<'a> Renderer<'a> {
         let render_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("Render Pipeline Layout"),
-                bind_group_layouts: &[camera_bind_group_layout, light_bind_group_layout],
+                bind_group_layouts: &[
+                    camera_bind_group_layout,
+                    light_bind_group_layout,
+                    texture_bind_group_layout,
+                ],
                 push_constant_ranges: &[],
             });
 
@@ -358,12 +369,12 @@ impl<'a> Renderer<'a> {
                     wgpu::VertexBufferLayout {
                         array_stride: std::mem::size_of::<Vertex>() as wgpu::BufferAddress,
                         step_mode: wgpu::VertexStepMode::Vertex,
-                        attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3],
+                        attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x2],
                     },
                     wgpu::VertexBufferLayout {
                         array_stride: std::mem::size_of::<InstanceRaw>() as wgpu::BufferAddress,
                         step_mode: wgpu::VertexStepMode::Instance,
-                        attributes: &wgpu::vertex_attr_array![2 => Float32x4, 3 => Float32x4, 4 => Float32x4, 5 => Float32x4, 6 => Float32x4],
+                        attributes: &wgpu::vertex_attr_array![3 => Float32x4, 4 => Float32x4, 5 => Float32x4, 6 => Float32x4, 7 => Float32x4],
                     },
                 ],
             },
@@ -415,12 +426,12 @@ impl<'a> Renderer<'a> {
                     wgpu::VertexBufferLayout {
                         array_stride: std::mem::size_of::<Vertex>() as wgpu::BufferAddress,
                         step_mode: wgpu::VertexStepMode::Vertex,
-                        attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3],
+                        attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x2],
                     },
                     wgpu::VertexBufferLayout {
                         array_stride: std::mem::size_of::<InstanceRaw>() as wgpu::BufferAddress,
                         step_mode: wgpu::VertexStepMode::Instance,
-                        attributes: &wgpu::vertex_attr_array![2 => Float32x4, 3 => Float32x4, 4 => Float32x4, 5 => Float32x4, 6 => Float32x4],
+                        attributes: &wgpu::vertex_attr_array![3 => Float32x4, 4 => Float32x4, 5 => Float32x4, 6 => Float32x4, 7 => Float32x4],
                     },
                 ],
             },
@@ -459,12 +470,12 @@ impl<'a> Renderer<'a> {
                     wgpu::VertexBufferLayout {
                         array_stride: std::mem::size_of::<Vertex>() as wgpu::BufferAddress,
                         step_mode: wgpu::VertexStepMode::Vertex,
-                        attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3],
+                        attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x2],
                     },
                     wgpu::VertexBufferLayout {
                         array_stride: std::mem::size_of::<InstanceRaw>() as wgpu::BufferAddress,
                         step_mode: wgpu::VertexStepMode::Instance,
-                        attributes: &wgpu::vertex_attr_array![2 => Float32x4, 3 => Float32x4, 4 => Float32x4, 5 => Float32x4, 6 => Float32x4],
+                        attributes: &wgpu::vertex_attr_array![3 => Float32x4, 4 => Float32x4, 5 => Float32x4, 6 => Float32x4, 7 => Float32x4],
                     },
                 ],
             },
@@ -652,6 +663,9 @@ impl<'a> Renderer<'a> {
 
         let (depth_texture, shadow_texture, shadow_view, shadow_sampler) = Self::init_textures(&device, &config);
 
+        let (texture_bind_group_layout, diffuse_bind_group) =
+            Self::init_diffuse_texture(&device, &queue)?;
+
         let camera_bind_group_layout_2d =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 entries: &[wgpu::BindGroupLayoutEntry {
@@ -703,6 +717,7 @@ impl<'a> Renderer<'a> {
             &config,
             &camera_bind_group_layout,
             &light_bind_group_layout,
+            &texture_bind_group_layout,
             &shadow_pipeline_layout,
             &camera_bind_group_layout_2d,
         );
@@ -731,6 +746,8 @@ impl<'a> Renderer<'a> {
             camera_bind_group,
             light_buffer,
             light_bind_group,
+            texture_bind_group_layout,
+            diffuse_bind_group,
             depth_texture,
             shadow_texture,
             shadow_view,
@@ -915,7 +932,7 @@ impl<'a> Renderer<'a> {
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: &self.depth_texture.view,
                     depth_ops: Some(wgpu::Operations {
-                        load: wgpu::LoadOp::Load,
+                        load: wgpu::LoadOp::Clear(1.0),
                         store: wgpu::StoreOp::Store,
                     }),
                     stencil_ops: None,
@@ -950,7 +967,7 @@ impl<'a> Renderer<'a> {
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: &self.depth_texture.view,
                     depth_ops: Some(wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(1.0),
+                        load: wgpu::LoadOp::Load,
                         store: wgpu::StoreOp::Store,
                     }),
                     stencil_ops: None,
@@ -962,6 +979,7 @@ impl<'a> Renderer<'a> {
             render_pass.set_pipeline(&self.render_pipeline);
             render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
             render_pass.set_bind_group(1, &self.light_bind_group, &[]);
+            render_pass.set_bind_group(2, &self.diffuse_bind_group, &[]);
             render_pass.set_vertex_buffer(0, self.mesh.vertex_buffer.slice(..));
             render_pass.set_vertex_buffer(1, self.instance_buffer.slice(..));
             render_pass.set_index_buffer(self.mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
@@ -1126,6 +1144,101 @@ impl<'a> Renderer<'a> {
         output.present();
 
         Ok(())
+    }
+
+    fn init_diffuse_texture(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+    ) -> Result<(wgpu::BindGroupLayout, wgpu::BindGroup), RendererError> {
+        let diffuse_bytes = include_bytes!("../../../assets/textures/placeholder.png");
+        let diffuse_image = image::load_from_memory(diffuse_bytes)?;
+        let diffuse_rgba = diffuse_image.to_rgba8();
+        let dimensions = diffuse_image.dimensions();
+
+        let texture_size = wgpu::Extent3d {
+            width: dimensions.0,
+            height: dimensions.1,
+            depth_or_array_layers: 1,
+        };
+
+        let diffuse_texture = device.create_texture(&wgpu::TextureDescriptor {
+            size: texture_size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            label: Some("diffuse_texture"),
+            view_formats: &[],
+        });
+
+        queue.write_texture(
+            wgpu::ImageCopyTexture {
+                texture: &diffuse_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &diffuse_rgba,
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(4 * dimensions.0),
+                rows_per_image: Some(dimensions.1),
+            },
+            texture_size,
+        );
+
+        let diffuse_texture_view =
+            diffuse_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let diffuse_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Nearest,
+            mipmap_filter: wgpu::FilterMode::Nearest,
+            ..Default::default()
+        });
+
+        let texture_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            multisampled: false,
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                ],
+                label: Some("texture_bind_group_layout"),
+            });
+
+        let diffuse_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            layout: &texture_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&diffuse_texture_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&diffuse_sampler),
+                },
+            ],
+            label: Some("diffuse_bind_group"),
+        });
+
+        Ok((texture_bind_group_layout, diffuse_bind_group))
     }
 }
 
