@@ -1,3 +1,5 @@
+pub mod lua;
+
 /// A trait for scripting language backends.
 pub trait ScriptingBackend {
     /// Called when a script is attached to an entity.
