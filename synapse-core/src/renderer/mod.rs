@@ -5,6 +5,8 @@ use crate::ecs::World;
 use crate::ecs::components::{ColorComponent, RectangleComponent, TransformComponent};
 use crate::renderer::culling::Frustum;
 use glam::{Mat4, Vec3};
+use std::path::Path;
+use tobj;
 use wgpu::util::DeviceExt;
 use egui;
 use egui_wgpu;
@@ -24,6 +26,10 @@ pub enum RendererError {
     GetDevice(#[from] wgpu::RequestDeviceError),
     #[error("Failed to load texture")]
     TextureLoad(#[from] image::ImageError),
+    #[error("Failed to load model")]
+    ModelLoad(#[from] tobj::LoadError),
+    #[error("No models found in file")]
+    NoModelsInFile,
 }
 
 pub struct RendererSettings {
@@ -111,65 +117,62 @@ struct InstanceRaw {
 }
 
 impl<'a> Renderer<'a> {
-    fn create_mesh(device: &wgpu::Device) -> Mesh {
-        let vertices = &[
-            // Front
-            Vertex { position: [-0.5, -0.5, 0.5], normal: [0.0, 0.0, 1.0], uv: [0.0, 1.0] },
-            Vertex { position: [0.5, -0.5, 0.5], normal: [0.0, 0.0, 1.0], uv: [1.0, 1.0] },
-            Vertex { position: [0.5, 0.5, 0.5], normal: [0.0, 0.0, 1.0], uv: [1.0, 0.0] },
-            Vertex { position: [-0.5, 0.5, 0.5], normal: [0.0, 0.0, 1.0], uv: [0.0, 0.0] },
-            // Back
-            Vertex { position: [-0.5, -0.5, -0.5], normal: [0.0, 0.0, -1.0], uv: [1.0, 1.0] },
-            Vertex { position: [0.5, -0.5, -0.5], normal: [0.0, 0.0, -1.0], uv: [0.0, 1.0] },
-            Vertex { position: [0.5, 0.5, -0.5], normal: [0.0, 0.0, -1.0], uv: [0.0, 0.0] },
-            Vertex { position: [-0.5, 0.5, -0.5], normal: [0.0, 0.0, -1.0], uv: [1.0, 0.0] },
-            // Right
-            Vertex { position: [0.5, -0.5, 0.5], normal: [1.0, 0.0, 0.0], uv: [0.0, 1.0] },
-            Vertex { position: [0.5, -0.5, -0.5], normal: [1.0, 0.0, 0.0], uv: [1.0, 1.0] },
-            Vertex { position: [0.5, 0.5, -0.5], normal: [1.0, 0.0, 0.0], uv: [1.0, 0.0] },
-            Vertex { position: [0.5, 0.5, 0.5], normal: [1.0, 0.0, 0.0], uv: [0.0, 0.0] },
-            // Left
-            Vertex { position: [-0.5, -0.5, 0.5], normal: [-1.0, 0.0, 0.0], uv: [1.0, 1.0] },
-            Vertex { position: [-0.5, -0.5, -0.5], normal: [-1.0, 0.0, 0.0], uv: [0.0, 1.0] },
-            Vertex { position: [-0.5, 0.5, -0.5], normal: [-1.0, 0.0, 0.0], uv: [0.0, 0.0] },
-            Vertex { position: [-0.5, 0.5, 0.5], normal: [-1.0, 0.0, 0.0], uv: [1.0, 0.0] },
-            // Top
-            Vertex { position: [-0.5, 0.5, 0.5], normal: [0.0, 1.0, 0.0], uv: [0.0, 1.0] },
-            Vertex { position: [0.5, 0.5, 0.5], normal: [0.0, 1.0, 0.0], uv: [1.0, 1.0] },
-            Vertex { position: [0.5, 0.5, -0.5], normal: [0.0, 1.0, 0.0], uv: [1.0, 0.0] },
-            Vertex { position: [-0.5, 0.5, -0.5], normal: [0.0, 1.0, 0.0], uv: [0.0, 0.0] },
-            // Bottom
-            Vertex { position: [-0.5, -0.5, 0.5], normal: [0.0, -1.0, 0.0], uv: [0.0, 0.0] },
-            Vertex { position: [0.5, -0.5, 0.5], normal: [0.0, -1.0, 0.0], uv: [1.0, 0.0] },
-            Vertex { position: [0.5, -0.5, -0.5], normal: [0.0, -1.0, 0.0], uv: [1.0, 1.0] },
-            Vertex { position: [-0.5, -0.5, -0.5], normal: [0.0, -1.0, 0.0], uv: [0.0, 1.0] },
-        ];
-        let indices: &[u16] = &[
-            0, 1, 2, 2, 3, 0,
-            4, 5, 6, 6, 7, 4,
-            8, 9, 10, 10, 11, 8,
-            12, 13, 14, 14, 15, 12,
-            16, 17, 18, 18, 19, 16,
-            20, 21, 22, 22, 23, 20,
-        ];
+    fn load_mesh(
+        device: &wgpu::Device,
+        path: impl AsRef<Path> + std::fmt::Debug,
+    ) -> Result<Mesh, RendererError> {
+        let (models, _materials) = tobj::load_obj(path, &tobj::GPU_LOAD_OPTIONS)?;
+
+        if models.is_empty() {
+            return Err(RendererError::NoModelsInFile);
+        }
+
+        let model = &models[0];
+        let mesh = &model.mesh;
+        let has_texcoords = !mesh.texcoords.is_empty();
+
+        let vertices: Vec<Vertex> = (0..mesh.positions.len() / 3)
+            .map(|i| {
+                let uv = if has_texcoords {
+                    [mesh.texcoords[2 * i], 1.0 - mesh.texcoords[2 * i + 1]]
+                } else {
+                    [0.0, 0.0]
+                };
+                Vertex {
+                    position: [
+                        mesh.positions[3 * i],
+                        mesh.positions[3 * i + 1],
+                        mesh.positions[3 * i + 2],
+                    ],
+                    normal: [
+                        mesh.normals[3 * i],
+                        mesh.normals[3 * i + 1],
+                        mesh.normals[3 * i + 2],
+                    ],
+                    uv,
+                }
+            })
+            .collect();
+
+        let indices: Vec<u16> = mesh.indices.iter().map(|i| *i as u16).collect();
 
         let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Vertex Buffer"),
-            contents: bytemuck::cast_slice(vertices),
+            contents: bytemuck::cast_slice(&vertices),
             usage: wgpu::BufferUsages::VERTEX,
         });
         let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Index Buffer"),
-            contents: bytemuck::cast_slice(indices),
+            contents: bytemuck::cast_slice(&indices),
             usage: wgpu::BufferUsages::INDEX,
         });
         let num_indices = indices.len() as u32;
 
-        Mesh {
+        Ok(Mesh {
             vertex_buffer,
             index_buffer,
             num_indices,
-        }
+        })
     }
 
     fn init_buffers_and_bind_groups(
@@ -722,7 +725,7 @@ impl<'a> Renderer<'a> {
             &camera_bind_group_layout_2d,
         );
 
-        let mesh = Self::create_mesh(&device);
+        let mesh = Self::load_mesh(&device, "../assets/models/cube.obj")?;
 
         let egui_context = egui::Context::default();
         let egui_winit_state = egui_winit::State::new(egui_context.clone(), egui::ViewportId::ROOT, &window, None, None);
@@ -967,6 +970,8 @@ impl<'a> Renderer<'a> {
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: &self.depth_texture.view,
                     depth_ops: Some(wgpu::Operations {
+                        // Load the depth buffer from the depth pre-pass.
+                        // This allows for early depth testing.
                         load: wgpu::LoadOp::Load,
                         store: wgpu::StoreOp::Store,
                     }),
