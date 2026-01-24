@@ -1,4 +1,5 @@
 pub mod components;
+pub mod systems;
 
 use std::any::TypeId;
 use std::collections::HashMap;
@@ -227,6 +228,17 @@ impl World {
         let new_location = self.entity_map.get_mut(&entity_id).unwrap();
         new_location.archetype_id = dest_archetype_id;
         new_location.row = dest_row;
+    }
+
+    /// Attaches a script to an entity.
+    pub fn add_script<B: crate::scripting::ScriptingBackend>(
+        &mut self,
+        entity_id: EntityId,
+        component: crate::ecs::components::ScriptComponent,
+        backend: &B,
+    ) {
+        backend.on_attach(entity_id as u64, &component.script_name);
+        self.add_component(entity_id, component);
     }
 
     /// Gets a reference to a component of type `T` for the given entity.

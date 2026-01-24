@@ -43,3 +43,10 @@ pub struct RectangleComponent {
 }
 
 impl Component for RectangleComponent {}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ScriptComponent {
+    pub script_name: String,
+}
+
+impl Component for ScriptComponent {}
