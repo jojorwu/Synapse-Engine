@@ -68,14 +68,29 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // Perform perspective divide and transform to UV space
     let shadow_uv = in.shadow_pos.xy / in.shadow_pos.w * 0.5 + 0.5;
 
-    // Sample the shadow map
-    var shadow = 1.0; // Default to not in shadow
-    if (shadow_uv.x > 0.0 && shadow_uv.x < 1.0 && shadow_uv.y > 0.0 && shadow_uv.y < 1.0) {
-        // use textureSampleCompare instead of textureSample
-        // the last argument is the depth to compare against
-        shadow = textureSampleCompare(shadow_map, shadow_sampler, shadow_uv, in.shadow_pos.z - 0.005);
-    }
+    // PCF - Percentage-Closer Filtering
+    var shadow = 0.0;
+    let shadow_map_size = 2048.0;
+    let texel_size = 1.0 / shadow_map_size;
 
+    // Check if the fragment is within the shadow map bounds
+    if (shadow_uv.x > 0.0 && shadow_uv.x < 1.0 && shadow_uv.y > 0.0 && shadow_uv.y < 1.0) {
+        for (var y = -1; y <= 1; y = y + 1) {
+            for (var x = -1; x <= 1; x = x + 1) {
+                let offset = vec2<f32>(f32(x) * texel_size, f32(y) * texel_size);
+                shadow = shadow + textureSampleCompare(
+                    shadow_map,
+                    shadow_sampler,
+                    shadow_uv + offset,
+                    in.shadow_pos.z - 0.005 // shadow bias
+                );
+            }
+        }
+        shadow = shadow / 9.0;
+    } else {
+        // If outside the shadow map, assume not in shadow.
+        shadow = 1.0;
+    }
 
     let normal = normalize(in.normal);
     let light_dir = normalize(light.position - in.world_position);
