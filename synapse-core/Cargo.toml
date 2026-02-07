@@ -15,3 +15,6 @@ egui-winit = "0.27.2"
 winit = "0.29.15"
 thiserror = "1.0"
 mlua = { version = "0.11.5", features = ["lua54", "vendored"] }
+image = { version = "0.25.1", default-features = true }
+tobj = { version = "4.0.0", features = ["log"] }
+log = "0.4"
